@@ -134,6 +134,9 @@ class ScanConfig:
     custom_headers: Dict[str, str] = field(default_factory=dict)
     proxy: str = ""
     scope_patterns: List[str] = field(default_factory=list)
+    # Enforced ScopePolicy (hackbot.core.scope). When set, every request and
+    # every redirect hop is checked; out-of-scope URLs are never contacted.
+    scope_policy: Optional[Any] = None
 
 
 # ── Link / Form Extractor ────────────────────────────────────────────────────
@@ -221,6 +224,15 @@ class HttpClient:
         if allow_redirects is None:
             allow_redirects = self.config.follow_redirects
 
+        policy = self.config.scope_policy
+        if policy is not None:
+            if not self._url_in_scope(url):
+                return None
+            if allow_redirects:
+                return self._request_following_in_scope(
+                    method, url, data=data, json_data=json_data, headers=headers,
+                )
+
         if self.config.request_delay > 0:
             time.sleep(self.config.request_delay)
 
@@ -255,6 +267,31 @@ class HttpClient:
         except requests.RequestException as e:
             logger.debug(f"Request failed: {method} {url} — {e}")
             return None
+
+    def _url_in_scope(self, url: str) -> bool:
+        policy = self.config.scope_policy
+        if policy is None:
+            return True
+        ok, why = policy.check_raw_target(url)
+        if not ok:
+            logger.warning("Scope: refusing request to %s (%s)", url, why)
+        return ok
+
+    def _request_following_in_scope(
+        self, method: str, url: str, max_hops: int = 5, **kwargs: Any,
+    ) -> Optional[requests.Response]:
+        """Follow redirects manually so each hop is scope-checked first."""
+        resp = self.request(method, url, allow_redirects=False, **kwargs)
+        hops = 0
+        while resp is not None and resp.is_redirect and hops < max_hops:
+            nxt = urljoin(resp.url or url, resp.headers.get("Location", ""))
+            if not self._url_in_scope(nxt):
+                return resp  # stop at the last in-scope response
+            method = "GET" if resp.status_code in (301, 302, 303) else method
+            resp = self.request(method, nxt, allow_redirects=False,
+                                headers=kwargs.get("headers"))
+            hops += 1
+        return resp
 
     def get(self, url: str, **kwargs: Any) -> Optional[requests.Response]:
         return self.request("GET", url, **kwargs)

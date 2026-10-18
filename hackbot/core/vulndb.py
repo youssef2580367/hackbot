@@ -375,7 +375,9 @@ class VulnDB:
         Returns:
             The finding ID (new or existing).
         """
-        title = finding.get("title", "Untitled")
+        # raw_title: the title without the "[UNVERIFIED LEAD]" label, so a
+        # lead that is later confirmed updates the same record.
+        title = finding.get("raw_title") or finding.get("title", "Untitled")
         severity = finding.get("severity", "Info")
         fp = _fingerprint(target, title, severity)
 
@@ -402,6 +404,11 @@ class VulnDB:
                         existing["id"],
                     ),
                 )
+                if finding.get("tags"):
+                    conn.execute(
+                        "UPDATE findings SET tags = ? WHERE id = ?",
+                        (json.dumps(finding["tags"]), existing["id"]),
+                    )
                 # If it was resolved but found again, reopen
                 if existing["status"] == "resolved":
                     self._change_status_internal(

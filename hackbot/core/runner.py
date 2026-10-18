@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from hackbot.config import INSTALL_DRIVERS, LOGS_DIR, resolve_tool_path
+from hackbot.core.escalation import EscalationLevel, classify as classify_escalation
+from hackbot.core.scope import ScopeAuditLog, ScopePolicy, ScopeVerdict
 
 # Lazy reference — filled at runtime to avoid circular imports
 _plugin_manager = None
@@ -141,6 +143,11 @@ class ToolRunner:
         sudo_password: str = "",
         on_confirm: Optional[Callable[[str, str], bool]] = None,
         on_output: Optional[Callable[[str], None]] = None,
+        scope_policy: Optional[ScopePolicy] = None,
+        scope_audit: Optional[ScopeAuditLog] = None,
+        escalation_gate: bool = True,
+        sample_limit: int = 1,
+        on_approve: Optional[Callable[[str, str], bool]] = None,
     ):
         self.allowed_tools = allowed_tools
         self.timeout = timeout
@@ -152,6 +159,19 @@ class ToolRunner:
         self.on_output = on_output
         self.history: List[ToolResult] = []
         self._sudo_validated = False
+        # Scope enforcement: when a policy is set, every command's network
+        # targets must be in scope. Out-of-scope is always refused;
+        # unverifiable targets need explicit human approval.
+        self.scope_policy = scope_policy
+        self.scope_audit = scope_audit
+        # Impact-escalation gate: data dumps, RCE escalation, state changes,
+        # credential attacks and heavy load need a human "yes" that
+        # auto_confirm cannot give.
+        self.escalation_gate = escalation_gate
+        self.sample_limit = sample_limit
+        # Human-only approver for the gates. Deliberately separate from
+        # on_confirm, which some front-ends wire to auto_confirm.
+        self.on_approve = on_approve
 
     def _normalize_command(self, command: str) -> str:
         """Normalize AI-generated command text into an executable command string."""
@@ -818,9 +838,80 @@ class ToolRunner:
             self.on_output(result.output)
         return result
 
+    # ── Scope + escalation gates ─────────────────────────────────────────
+
+    def _blocked(self, command: str, tool_name: str, reason: str, code: int = -1) -> ToolResult:
+        return ToolResult(
+            tool=self._infer_tool_name(command, tool_name),
+            command=command,
+            stdout="",
+            stderr=reason,
+            return_code=code,
+            duration=0,
+            success=False,
+        )
+
+    def _ask_human(self, command: str, reason: str) -> bool:
+        """Explicit approval that auto_confirm can never satisfy."""
+        if not self.on_approve:
+            return False
+        try:
+            return bool(self.on_approve(command, reason))
+        except Exception:
+            return False
+
+    def check_gates(
+        self, command: str, preapproved: bool = False,
+    ) -> tuple[Optional[str], bool]:
+        """Run the scope and escalation gates on *command*.
+
+        Returns (refusal_reason, human_approved). ``refusal_reason`` is None
+        when the command may run.
+        """
+        approved = False
+        if self.scope_policy is not None:
+            decision = self.scope_policy.check_command(command)
+            if decision.verdict == ScopeVerdict.DENY:
+                self._audit(command, decision, "blocked")
+                return f"OUT OF SCOPE: {decision.reason}", False
+            if decision.verdict == ScopeVerdict.UNKNOWN:
+                if preapproved or self._ask_human(
+                    command,
+                    f"SCOPE UNVERIFIED: {decision.reason}. "
+                    f"Approve only if every host this reaches is in scope.\n"
+                    f"{self.scope_policy.summary()}",
+                ):
+                    self._audit(command, decision, "approved_unverified")
+                    approved = True
+                else:
+                    self._audit(command, decision, "blocked_unverified")
+                    return f"SCOPE UNVERIFIED: {decision.reason}", False
+            else:
+                self._audit(command, decision, "allowed")
+
+        if self.escalation_gate:
+            esc = classify_escalation(command, sample_limit=self.sample_limit)
+            if esc.level == EscalationLevel.BLOCK:
+                return (
+                    f"ESCALATION BLOCKED [{esc.category}]: {esc.reason}. "
+                    f"Minimal proof instead: {esc.minimal_alternative}"
+                ), False
+            if esc.level == EscalationLevel.APPROVAL and not preapproved:
+                if not self._ask_human(command, esc.prompt_text()):
+                    return (
+                        f"ESCALATION NOT APPROVED [{esc.category}]: {esc.reason}. "
+                        f"Minimal proof instead: {esc.minimal_alternative}"
+                    ), False
+                approved = True
+        return None, approved
+
+    def _audit(self, command: str, decision: Any, action: str) -> None:
+        if self.scope_audit is not None:
+            self.scope_audit.record(command, decision, action)
+
     def execute(
         self, command: str, tool_name: str = "", explanation: str = "",
-        allow_install_drivers: bool = False,
+        allow_install_drivers: bool = False, preapproved: bool = False,
     ) -> ToolResult:
         """
         Execute a command synchronously with timeout and output capture.
@@ -828,6 +919,16 @@ class ToolRunner:
         subprocesses without invoking a shell.
         """
         command = self._normalize_command(command)
+
+        # Scope + impact-escalation gates run before anything else,
+        # plugins included. Installs (allow_install_drivers) only touch
+        # package managers, not targets.
+        human_approved = False
+        if not allow_install_drivers:
+            refusal, human_approved = self.check_gates(command, preapproved=preapproved)
+            if refusal:
+                code = -2 if "NOT APPROVED" in refusal else -1
+                return self._blocked(command, tool_name, f"BLOCKED: {refusal}", code)
 
         # Plugin execution — intercept hackbot-plugin commands
         if command.strip().startswith("hackbot-plugin "):
@@ -852,8 +953,8 @@ class ToolRunner:
                 success=False,
             )
 
-        # Check for risky commands
-        if "RISKY" in reason and not self.auto_confirm:
+        # Check for risky commands (skip if a human already approved it above)
+        if "RISKY" in reason and not self.auto_confirm and not human_approved:
             if self.on_confirm:
                 confirmed = self.on_confirm(command, reason)
                 if not confirmed:
@@ -948,6 +1049,11 @@ class ToolRunner:
         """Execute a command asynchronously (shell-free; parity with execute())."""
         command = self._normalize_command(command)
 
+        refusal, human_approved = self.check_gates(command)
+        if refusal:
+            code = -2 if "NOT APPROVED" in refusal else -1
+            return self._blocked(command, tool_name, f"BLOCKED: {refusal}", code)
+
         # Plugin execution — intercept hackbot-plugin commands
         if command.strip().startswith("hackbot-plugin "):
             return self._execute_plugin(command, tool_name)
@@ -969,7 +1075,7 @@ class ToolRunner:
             )
 
         # Check for risky commands
-        if "RISKY" in reason and not self.auto_confirm:
+        if "RISKY" in reason and not self.auto_confirm and not human_approved:
             if self.on_confirm:
                 confirmed = self.on_confirm(command, reason)
                 if not confirmed:

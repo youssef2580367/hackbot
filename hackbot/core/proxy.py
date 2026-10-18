@@ -256,7 +256,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         host = host_port.split(":")[0]
 
         # Scope check
-        if engine.scope and not any(s in host for s in engine.scope):
+        if not engine.in_scope(host):
             self.send_error(403, "Out of scope")
             return
 
@@ -307,7 +307,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             path += f"?{parsed.query}"
 
         # Scope check
-        if engine.scope and not any(s in host for s in engine.scope):
+        if not engine.in_scope(host):
             self.send_error(403, "Out of scope")
             return
 
@@ -595,6 +595,21 @@ class ProxyEngine:
         """Remove all scope restrictions."""
         self.scope = []
 
+    def in_scope(self, host: str) -> bool:
+        """True when *host* is a scope domain or one of its subdomains.
+
+        Label-aware: scope ``example.com`` matches ``api.example.com`` but
+        not ``evilexample.com`` (the old substring check matched both).
+        """
+        if not self.scope:
+            return True
+        host = (host or "").lower().split(":")[0].strip(".")
+        for entry in self.scope:
+            dom = entry[2:] if entry.startswith("*.") else entry
+            if host == dom or host.endswith("." + dom):
+                return True
+        return False
+
     # ── Statistics ────────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, Any]:
@@ -643,6 +658,9 @@ class ProxyEngine:
         """
         original = self.get_request_by_id(req_id)
         if not original:
+            return None
+        if not self.in_scope(original.host):
+            logger.warning("Replay refused: %s is out of proxy scope", original.host)
             return None
 
         start_time = time.time()

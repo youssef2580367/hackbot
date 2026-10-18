@@ -339,8 +339,9 @@ EXAMPLES of WRONG commands (DO NOT do this):
 
 To report a finding:
 ```json
-{"action": "finding", "title": "<title>", "severity": "<Critical|High|Medium|Low|Info>", "description": "<details>", "evidence": "<output>", "recommendation": "<fix>"}
+{"action": "finding", "title": "<title>", "severity": "<Critical|High|Medium|Low|Info>", "vuln_class": "<idor|sqli|xss|ssrf|...>", "description": "<details>", "behavior": "<what the target technically did>", "boundary": "<security boundary crossed, e.g. object-level authorization between users>", "impact": "<what was actually obtained/done — demonstrated, no 'could/may'>", "evidence_refs": [{"step": <step #>, "excerpt": "<verbatim text from that step's output>", "supports": "<behavior|impact|both>"}], "reproduction": "<exact requests/commands to replay>", "asset": "<affected URL>", "privileges_required": "<none|user|admin>", "attacker_identity": "<account A>", "victim_identity": "<account B, auth classes>", "victim_identifier": "<B's id/email as it appears in the evidence>", "chained_with": ["<title of confirmed finding this chains with>"], "evidence": "<output>", "recommendation": "<fix>"}
 ```
+PROOF GATE: a finding is CONFIRMED only when behavior, boundary and impact are stated and every evidence_refs excerpt appears verbatim in the output of a command you actually ran (step numbers are shown in each tool result). Text you printed yourself (echo, print in your own scripts) is not evidence. Anything less is stored as an UNVERIFIED LEAD and reported as such — that is fine; never invent or embellish evidence.
 
 To save a generated script or exploit helper for this assessment:
 ```json

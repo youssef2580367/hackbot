@@ -29,6 +29,10 @@ from hackbot.core.cve import CVELookup
 from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
+from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
+from hackbot.core.proof import Observation, ProofGate, RecordedEvidence, Verification
+from hackbot.core.scope import ScopeAuditLog, ScopePolicy
+from hackbot.core.validation import FindingValidator, ProgramRules, RuleSet
 from hackbot.core.runner import ToolResult, ToolRunner
 from hackbot.core.vulndb import VulnDB
 from hackbot.core.zeroday import ZeroDayEngine
@@ -66,16 +70,79 @@ class Finding:
     recommendation: str = ""
     tool: str = ""
     timestamp: float = field(default_factory=time.time)
+    # ── Proof gate ──────────────────────────────────────────────────────
+    behavior: str = ""
+    boundary: str = ""
+    impact: str = ""
+    vuln_class: str = ""
+    reproduction: str = ""
+    evidence_refs: List[Any] = field(default_factory=list)
+    recorded: List[RecordedEvidence] = field(default_factory=list)
+    verification: Verification = Verification.LEAD
+    proof: Dict[str, Any] = field(default_factory=dict)
+    # ── Pre-validation context (7-Question Gate) ────────────────────────
+    asset: str = ""
+    privileges_required: str = ""
+    attacker_identity: str = ""
+    victim_identity: str = ""
+    victim_identifier: str = ""
+    chained_with: List[str] = field(default_factory=list)
+    validation: Dict[str, Any] = field(default_factory=dict)
+    # ── False-positive screen (machine label + human review) ────────────
+    fp_triage: Dict[str, Any] = field(default_factory=dict)
+    db_id: Optional[int] = None
+
+    LEAD_PREFIX = "[UNVERIFIED LEAD] "
+    DISMISSED_PREFIX = "[DISMISSED — FALSE POSITIVE] "
+
+    @property
+    def confirmed(self) -> bool:
+        return self.verification == Verification.CONFIRMED
+
+    @property
+    def dismissed(self) -> bool:
+        """True only after a *human* marked it a false positive."""
+        review = self.fp_triage.get("review") or {}
+        return review.get("decision") == ReviewDecision.FALSE_POSITIVE.value
+
+    def _display_title(self) -> str:
+        if self.dismissed:
+            return self.DISMISSED_PREFIX + self.title
+        return self.title if self.confirmed else self.LEAD_PREFIX + self.title
 
     def to_dict(self) -> Dict[str, Any]:
+        # Every report/export goes through to_dict(); an unverified lead is
+        # labelled here so no output can present it as a confirmed vuln.
         return {
-            "title": self.title,
+            "title": self._display_title(),
+            "raw_title": self.title,
             "severity": self.severity.value,
             "description": self.description,
             "evidence": self.evidence,
             "recommendation": self.recommendation,
             "tool": self.tool,
             "timestamp": self.timestamp,
+            "verification": self.verification.value,
+            "behavior": self.behavior,
+            "boundary": self.boundary,
+            "impact": self.impact,
+            "vuln_class": self.vuln_class,
+            "reproduction": self.reproduction,
+            "evidence_refs": self.evidence_refs,
+            "recorded_evidence": [r.to_dict() for r in self.recorded],
+            "proof": self.proof,
+            "asset": self.asset,
+            "privileges_required": self.privileges_required,
+            "attacker_identity": self.attacker_identity,
+            "victim_identity": self.victim_identity,
+            "victim_identifier": self.victim_identifier,
+            "chained_with": self.chained_with,
+            "validation": self.validation,
+            "fp_triage": self.fp_triage,
+            "dismissed": self.dismissed,
+            "db_id": self.db_id,
+            "tags": [f"verification:{self.verification.value}",
+                     f"fp:{self.fp_triage.get('label', 'unscreened')}"],
         }
 
 
@@ -149,6 +216,7 @@ class AgentMode:
         on_confirm: Optional[Callable[[str, str], bool]] = None,
         on_output: Optional[Callable[[str], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
+        on_approve: Optional[Callable[[str, str], bool]] = None,
     ):
         self.engine = engine
         self.config = config
@@ -164,8 +232,15 @@ class AgentMode:
             sudo_password=config.agent.sudo_password,
             on_confirm=on_confirm,
             on_output=on_output,
+            scope_audit=ScopeAuditLog() if config.scope.audit_log else None,
+            escalation_gate=config.scope.escalation_gate,
+            sample_limit=config.scope.sample_limit,
+            on_approve=on_approve,
         )
         self.installer = ToolInstaller(self.runner)
+        self.scope_policy: Optional[ScopePolicy] = None
+        self.program_rules: Optional[ProgramRules] = None
+        self._validator: Optional[FindingValidator] = None
 
         self.conversation: Optional[Conversation] = None
         self.target: str = ""
@@ -205,7 +280,31 @@ class AgentMode:
         if self._rag_enabled:
             logger.debug("RAG memory active for agent mode")
 
-    def start(self, target: str, scope: str = "", instructions: str = "") -> str:
+    def build_scope_policy(self, target: str, scope: str = "", scope_file: str = "") -> Optional[ScopePolicy]:
+        """Resolve the enforced scope policy for an assessment.
+
+        Precedence: explicit scope file → configured scope file → ``scope``
+        string when it is a rule list (``*.example.com,!admin.example.com``)
+        → the target's exact host (when ``auto_from_target`` is on).
+        Returns None only when enforcement is disabled.
+        """
+        cfg = self.config.scope
+        if not cfg.enforce:
+            return None
+        path = scope_file or cfg.file
+        if path:
+            # The same YAML may carry program rules (excluded_classes, caps).
+            self.program_rules = ProgramRules.from_file(path)
+            return ScopePolicy.from_file(path)
+        if scope:
+            policy = ScopePolicy.from_rules_string(scope)
+            if policy is not None:
+                return policy
+        if cfg.auto_from_target:
+            return ScopePolicy.from_target(target)
+        return None
+
+    def start(self, target: str, scope: str = "", instructions: str = "", scope_file: str = "") -> str:
         """
         Start a new assessment against a target.
 
@@ -216,6 +315,17 @@ class AgentMode:
         """
         self.target = target
         self.scope = scope
+        try:
+            self.scope_policy = self.build_scope_policy(target, scope, scope_file)
+        except (OSError, ValueError) as exc:
+            self.is_running = False
+            return f"⛔ Invalid scope definition: {exc}\n\nFix the scope file/rules and retry."
+        self.runner.scope_policy = self.scope_policy
+        if self.scope_policy is not None:
+            ok, why = self.scope_policy.check_raw_target(target)
+            if not ok:
+                self.is_running = False
+                return f"⛔ Target is outside the enforced scope: {why}\n\n{self.scope_policy.summary()}"
         self.steps = []
         self.findings = []
         self.scripts = []
@@ -253,6 +363,9 @@ class AgentMode:
         context = f"""Assessment Context:
 - Target: {target}
 - Scope: {scope or 'Full assessment as authorized'}
+- Enforced Scope (commands touching anything else are refused):
+{self.scope_policy.summary() if self.scope_policy else 'NOT ENFORCED (scope.enforce is off)'}
+- Impact escalation (data dumps, RCE escalation, PII, state-changing requests, brute force) requires explicit human approval; prove impact with the minimal action first.
 - Safe Mode: {'Enabled' if self.config.agent.safe_mode else 'Disabled'}
 - Available Tools: {', '.join(installed) if installed else 'None detected'}
 - Unavailable Tools: {', '.join(not_installed) if not_installed else 'None'}
@@ -551,17 +664,20 @@ Explain your reasoning at each step."""
         if not self.findings:
             return "No findings recorded yet."
 
-        lines = ["# Security Findings\n"]
+        dismissed = [f for f in self.findings if f.dismissed]
+        confirmed = [f for f in self.findings if f.confirmed and not f.dismissed]
+        leads = [f for f in self.findings if not f.confirmed and not f.dismissed]
+        lines = ["# Security Findings\n",
+                 f"**Confirmed: {len(confirmed)}** | Unverified leads: {len(leads)}"
+                 f" | Dismissed (human review): {len(dismissed)}\n"]
         by_severity: Dict[str, List[Finding]] = {}
-        for f in self.findings:
+        for f in confirmed:
             sev = f.severity.value
             by_severity.setdefault(sev, []).append(f)
 
         stats = {s: len(fs) for s, fs in by_severity.items()}
-        lines.append(
-            f"**Total: {len(self.findings)}** | "
-            + " | ".join(f"{s}: {c}" for s, c in stats.items())
-        )
+        if stats:
+            lines.append(" | ".join(f"{s}: {c}" for s, c in stats.items()))
         lines.append("")
 
         for severity in ["Critical", "High", "Medium", "Low", "Info"]:
@@ -576,9 +692,40 @@ Explain your reasoning at each step."""
                     lines.append(f"\n**Evidence:**\n```\n{f.evidence}\n```")
                 if f.recommendation:
                     lines.append(f"\n**Recommendation:** {f.recommendation}")
+                lines.extend(self._fp_lines(f))
                 lines.append("")
 
+        if leads:
+            lines.append(f"\n## Unverified leads ({len(leads)}) — NOT confirmed vulnerabilities\n")
+            for i, f in enumerate(leads, 1):
+                lines.append(f"### L{i}. {f.title} (claimed {f.severity.value})")
+                if f.description:
+                    lines.append(f"\n{f.description}")
+                missing = f.proof.get("missing", [])
+                if missing:
+                    lines.append("\n**Missing proof:**")
+                    lines.extend(f"- {m}" for m in missing)
+                lines.extend(self._fp_lines(f))
+                lines.append("")
+
+        if dismissed:
+            lines.append(f"\n## Dismissed after human review ({len(dismissed)})\n")
+            for f in dismissed:
+                review = f.fp_triage.get("review", {})
+                lines.append(f"- **{f.title}** — {review.get('note') or 'no note'}")
+
         return "\n".join(lines)
+
+    @staticmethod
+    def _fp_lines(f: Finding) -> List[str]:
+        signals = f.fp_triage.get("signals") or []
+        if not signals:
+            return []
+        review = f.fp_triage.get("review")
+        head = (f"\n**⚠ False-positive signals ({f.fp_triage.get('label')})"
+                + (f", reviewed: {review['decision']}" if review else ", not yet reviewed")
+                + ":**")
+        return [head] + [f"- {x['code']}: {x['explanation']}" for x in signals]
 
     def _process_actions_loop(
         self,
@@ -649,7 +796,9 @@ Explain your reasoning at each step."""
                             repeated_failures.append(tool_result)
                 elif atype == "finding":
                     ai_analysis_clean = self._extract_thoughts(ai_response_text)
-                    self._record_finding(action, ai_analysis=ai_analysis_clean)
+                    results_text.append(
+                        self._record_finding(action, ai_analysis=ai_analysis_clean)
+                    )
                 elif atype == "script":
                     ai_analysis_clean = self._extract_thoughts(ai_response_text)
                     script_result = self._save_script(action, ai_analysis=ai_analysis_clean)
@@ -918,7 +1067,8 @@ Explain your reasoning at each step."""
 
         status = "SUCCESS" if result.success else "FAILED"
         output = (
-            f"**[{tool}]** {status} (exit={result.return_code}, {result.duration:.1f}s)\n"
+            f"**[{tool}]** {status} (exit={result.return_code}, {result.duration:.1f}s) "
+            f"— step #{step.step_num}\n"
             f"Command: `{command}`\n\n"
             f"```\n{result.output[:5000]}\n```"
         )
@@ -1120,6 +1270,14 @@ Explain your reasoning at each step."""
             f"Parameter: `{parameter or 'request body'}` | Categories: {', '.join(categories) or 'all'}\n",
         ]
 
+        # One scope/escalation decision for the whole batch (fuzzing sends
+        # POST bodies, so it needs a human "yes" once, not 20 times). Scope
+        # is still re-checked on every request inside runner.execute().
+        probe = f"curl -sk -d '{parameter or 'probe'}=x' '{target_url}'"
+        refusal, _ = self.runner.check_gates(probe)
+        if refusal:
+            return f"**[Fuzz]** BLOCKED: {refusal}"
+
         interesting_count = 0
         for i, payload in enumerate(payloads[:20]):  # Cap at 20 for performance
             # Use curl to send the payload
@@ -1130,7 +1288,8 @@ Explain your reasoning at each step."""
                 cmd = f"curl -sk -o /dev/null -w '%{{http_code}} %{{time_total}} %{{size_download}}' -d '{safe_payload}' '{target_url}'"
 
             result = self.runner.execute(
-                cmd, tool_name="curl", explanation=f"Fuzz payload {i+1}/{len(payloads)} ({explanation})"
+                cmd, tool_name="curl", explanation=f"Fuzz payload {i+1}/{len(payloads)} ({explanation})",
+                preapproved=True,
             )
 
             if result.success and result.stdout.strip():
@@ -1235,27 +1394,251 @@ Explain your reasoning at each step."""
 
         return report
 
-    def _record_finding(self, action: Dict[str, Any], ai_analysis: str = "") -> None:
-        """Record a security finding."""
+    def _observations(self) -> List[Observation]:
+        """Output of commands HackBot really executed (evidence sources)."""
+        obs: List[Observation] = []
+        for st in self.steps:
+            r = st.tool_result
+            if r is None or r.return_code in (-1, -2) or r.stderr.startswith("BLOCKED"):
+                continue
+            o = Observation.from_command(st.step_num, r.command, f"{r.stdout}\n{r.stderr}")
+            if o is not None:
+                obs.append(o)
+        return obs
+
+    def _find_existing(self, title: str) -> Optional[Finding]:
+        key = title.strip().lower()
+        for f in self.findings:
+            if f.title.strip().lower() == key:
+                return f
+        return None
+
+    def evaluate_finding(self, finding: Finding) -> None:
+        """(Re)run the proof gate on *finding* and update its verification."""
+        result = ProofGate().evaluate(
+            title=finding.title,
+            behavior=finding.behavior,
+            boundary=finding.boundary,
+            impact=finding.impact,
+            evidence_refs=finding.evidence_refs,
+            observations=self._observations(),
+            recorded=finding.recorded,
+            vuln_class=finding.vuln_class,
+        )
+        finding.verification = result.verification
+        finding.proof = result.to_dict()
+        self.screen_false_positive(finding)
+        self.prevalidate(finding)
+
+    def _step_outputs(self) -> Dict[int, Dict[str, str]]:
+        return {
+            st.step_num: {"command": st.tool_result.command,
+                          "output": f"{st.tool_result.stdout}\n{st.tool_result.stderr}"}
+            for st in self.steps if st.tool_result is not None
+        }
+
+    def screen_false_positive(self, finding: Finding) -> Dict[str, Any]:
+        """Machine FP screen. Keeps any existing human review untouched."""
+        review = finding.fp_triage.get("review")
+        finding.fp_triage = FalsePositiveClassifier().classify(
+            finding.to_dict(), self._step_outputs())
+        if review:
+            finding.fp_triage["review"] = review
+        return finding.fp_triage
+
+    def review_finding(self, index: int, decision: str, note: str = "") -> Finding:
+        """Record a human review decision. Nothing is ever deleted."""
+        finding = self.findings[index]
+        dec = ReviewDecision(decision)
+        finding.fp_triage["review"] = FPReview(dec, note).to_dict()
+        if finding.db_id is not None:
+            try:
+                rec = self.vulndb.get_finding(finding.db_id)
+                current = getattr(rec, "status", "open") if rec else "open"
+                if dec == ReviewDecision.FALSE_POSITIVE and current != "false_positive":
+                    self.vulndb.update_status(finding.db_id, "false_positive", note,
+                                              changed_by="hunter")
+                elif dec != ReviewDecision.FALSE_POSITIVE and current == "false_positive":
+                    self.vulndb.update_status(finding.db_id, "open",
+                                              f"review: {dec.value}. {note}".strip(),
+                                              changed_by="hunter")
+            except Exception as exc:
+                logger.warning("VulnDB: failed to record review: %s", exc)
+        self.prevalidate(finding)
+        return finding
+
+    @property
+    def validator(self) -> FindingValidator:
+        if self._validator is None:
+            vcfg = self.config.validation
+            self._validator = FindingValidator(RuleSet.load(
+                Path(vcfg.validator_path).expanduser() if vcfg.validator_path else None,
+                Path(vcfg.gotchas_path).expanduser() if vcfg.gotchas_path else None,
+            ))
+        return self._validator
+
+    def prevalidate(self, finding: Finding) -> Dict[str, Any]:
+        """Run the offline 7-Question Gate checks and store the result."""
+        try:
+            result = self.validator.validate(
+                finding.to_dict(),
+                scope_policy=self.scope_policy,
+                program=self.program_rules,
+                confirmed_titles=[f.title for f in self.findings if f.confirmed],
+            )
+            finding.validation = result.to_dict()
+        except Exception as exc:  # never let validation break the hunt
+            logger.warning("Pre-validation failed: %s", exc)
+            finding.validation = {"label": "ERROR", "reason": str(exc)}
+        return finding.validation
+
+    def export_handoff(self, index: int, out_dir: Optional[str] = None) -> Path:
+        """Write the Claude Code validation packet for finding *index*."""
+        from hackbot.core.handoff import default_handoff_dir, export_packet
+
+        finding = self.findings[index]
+        steps = self._step_outputs()
+        base = Path(out_dir).expanduser() if out_dir else default_handoff_dir(
+            self.config.validation.handoff_dir)
+        return export_packet(
+            finding.to_dict(), index + 1, self.target or "target", steps,
+            scope_summary=self.scope_policy.summary() if self.scope_policy else "",
+            out_dir=base,
+        )
+
+    def attest_evidence(self, index: int, path: str, note: str = "") -> Finding:
+        """Attach a human-recorded artifact (Burp/HAR/screenshot) and re-evaluate.
+
+        This is how state-changing or dangerous proofs are confirmed: the
+        human performs/records them once, and HackBot hashes the recording
+        instead of replaying the request automatically.
+        """
+        finding = self.findings[index]
+        finding.recorded.append(RecordedEvidence.attest(path, note))
+        self.evaluate_finding(finding)
+        self._persist_finding(finding)
+        return finding
+
+    def reproduce_finding(self, index: int) -> Dict[str, Any]:
+        """Controlled replay of the commands behind a finding's observed evidence.
+
+        Each command goes back through ToolRunner, so scope is enforced and any
+        state-changing / escalation step needs an explicit human approval — a
+        declined or blocked replay is reported, never forced. If a replayed
+        command no longer shows its excerpt, the finding drops back to LEAD.
+        """
+        finding = self.findings[index]
+        refs = [r for r in finding.proof.get("verified_refs", [])
+                if r.get("source") in ("observed", "agent_script")]
+        if not refs:
+            return {"reproduced": False, "detail": "no observed evidence to replay"}
+        outcome: List[Dict[str, Any]] = []
+        for cmd in dict.fromkeys(r["command"] for r in refs):
+            res = self.runner.execute(cmd, explanation=f"Replay evidence for {finding.title}")
+            output = f"{res.stdout}\n{res.stderr}"
+            norm_out = " ".join(output.split())
+            for r in (x for x in refs if x["command"] == cmd):
+                seen = " ".join(r["excerpt"].split()) in norm_out
+                outcome.append({"command": cmd, "excerpt": r["excerpt"], "reproduced": seen,
+                                "blocked": res.stderr.startswith("BLOCKED")})
+        ok = all(o["reproduced"] for o in outcome)
+        finding.proof["reproduction"] = {"ok": ok, "results": outcome, "at": time.time()}
+        if not ok and finding.confirmed:
+            finding.verification = Verification.LEAD
+            finding.proof.setdefault("missing", []).append(
+                "controlled replay did not reproduce the cited evidence"
+            )
+            self._persist_finding(finding)
+        return {"reproduced": ok, "results": outcome}
+
+    def _record_finding(self, action: Dict[str, Any], ai_analysis: str = "") -> str:
+        """Record a finding; the proof gate decides CONFIRMED vs LEAD."""
         try:
             severity = Severity(action.get("severity", "Info"))
         except ValueError:
             severity = Severity.INFO
 
-        finding = Finding(
-            title=action.get("title", "Untitled Finding"),
-            severity=severity,
-            description=action.get("description", ""),
-            evidence=action.get("evidence", ""),
-            recommendation=action.get("recommendation", ""),
+        title = action.get("title", "Untitled Finding")
+        refs = action.get("evidence_refs") or []
+        if not isinstance(refs, list):
+            refs = [refs]
+        existing = self._find_existing(title)
+        if existing is not None:
+            # Same finding re-submitted with more evidence — upgrade in place.
+            finding = existing
+            finding.severity = severity
+            for attr in ("description", "evidence", "recommendation", "behavior",
+                         "boundary", "impact", "vuln_class", "reproduction", "asset",
+                         "privileges_required", "attacker_identity", "victim_identity",
+                         "victim_identifier"):
+                val = action.get(attr)
+                if val:
+                    setattr(finding, attr, str(val))
+            finding.evidence_refs = finding.evidence_refs + refs
+            if action.get("chained_with"):
+                finding.chained_with = list(action["chained_with"])
+        else:
+            finding = Finding(
+                title=title,
+                severity=severity,
+                description=action.get("description", ""),
+                evidence=action.get("evidence", ""),
+                recommendation=action.get("recommendation", ""),
+                behavior=str(action.get("behavior", "")),
+                boundary=str(action.get("boundary", "")),
+                impact=str(action.get("impact", "")),
+                vuln_class=str(action.get("vuln_class", "")),
+                reproduction=str(action.get("reproduction", "")),
+                evidence_refs=list(refs),
+                asset=str(action.get("asset", "")),
+                privileges_required=str(action.get("privileges_required", "")),
+                attacker_identity=str(action.get("attacker_identity", "")),
+                victim_identity=str(action.get("victim_identity", "")),
+                victim_identifier=str(action.get("victim_identifier", "")),
+                chained_with=list(action.get("chained_with") or []),
+            )
+            self.findings.append(finding)
+
+        self.evaluate_finding(finding)
+        self._persist_finding(finding)
+
+        label = "CONFIRMED" if finding.confirmed else "LEAD"
+        step = AgentStep(
+            step_num=len(self.steps) + 1,
+            action="finding",
+            description=f"[{severity.value}][{label}] {finding.title}",
+            finding=finding,
+            ai_analysis=ai_analysis,
+        )
+        self.steps.append(step)
+        if self.on_step:
+            self.on_step(step)
+
+        fp = finding.fp_triage
+        fp_note = ""
+        if fp.get("signals"):
+            fp_note = "\n**[FP screen]** " + fp.get("label", "") + ": " + "; ".join(
+                f"{x['code']} — {x['explanation']}" for x in fp["signals"])
+        if finding.confirmed:
+            v = finding.validation
+            return fp_note.lstrip("\n") + ("\n" if fp_note else "") + (
+                f"**[Proof gate]** `{finding.title}` → CONFIRMED (all pillars verified).\n"
+                f"**[Pre-validation]** {v.get('label', '?')} — {v.get('reason', '')}"
+            )
+        missing = "\n".join(f"- {m}" for m in finding.proof.get("missing", []))
+        return (
+            f"**[Proof gate]** `{finding.title}` recorded as an UNVERIFIED LEAD. Missing:\n"
+            f"{missing}\n"
+            "Gather the missing evidence with in-scope, non-destructive requests and "
+            "re-submit the same title, or leave it as a lead. Never invent evidence."
         )
 
-        self.findings.append(finding)
-
+    def _persist_finding(self, finding: Finding) -> None:
+        """Store *finding* in the vulnerability DB and RAG memory."""
         # Persist to vulnerability database
         if self._assessment_id is not None:
             try:
-                self.vulndb.add_finding(
+                finding.db_id = self.vulndb.add_finding(
                     self._assessment_id,
                     finding.to_dict(),
                     target=self.target,
@@ -1271,18 +1654,6 @@ Explain your reasoning at each step."""
                 self.rag.store_finding(finding_data)
             except Exception as exc:
                 logger.debug("RAG finding store failed: %s", exc)
-
-        step = AgentStep(
-            step_num=len(self.steps) + 1,
-            action="finding",
-            description=f"[{severity.value}] {finding.title}",
-            finding=finding,
-            ai_analysis=ai_analysis,
-        )
-        self.steps.append(step)
-
-        if self.on_step:
-            self.on_step(step)
 
     def _generate_report(self, action: Dict[str, Any], ai_analysis: str = "") -> str:
         """Generate a PDF report from current findings."""

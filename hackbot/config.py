@@ -46,6 +46,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "temperature": 0.2,
         "max_tokens": 4096,
     },
+    "validation": {
+        "handoff_dir": "",
+        "validator_path": "",
+        "gotchas_path": "",
+    },
+    "scope": {
+        "enforce": True,
+        "file": "",
+        "auto_from_target": True,
+        "audit_log": True,
+        "escalation_gate": True,
+        "sample_limit": 1,
+    },
     "agent": {
         "auto_confirm": False,
         "max_steps": 50,
@@ -208,6 +221,25 @@ class AgentConfig:
 
 
 @dataclass
+class ScopeConfig:
+    """Scope enforcement and impact-escalation gate settings."""
+    enforce: bool = True
+    file: str = ""
+    auto_from_target: bool = True
+    audit_log: bool = True
+    escalation_gate: bool = True
+    sample_limit: int = 1
+
+
+@dataclass
+class ValidationConfig:
+    """Pre-validation rule sources and the Claude Code handoff directory."""
+    handoff_dir: str = ""      # "" → ./hackbot-findings
+    validator_path: str = ""   # "" → ~/.claude/agents/validator.md
+    gotchas_path: str = ""     # "" → installed ywh gotchas skill
+
+
+@dataclass
 class ReportingConfig:
     format: str = "html"
     auto_save: bool = True
@@ -245,6 +277,8 @@ class HackBotConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
+    scope: ScopeConfig = field(default_factory=ScopeConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
 
 
 def reconcile_keys(ai: Dict[str, Any]) -> None:
@@ -395,6 +429,8 @@ def load_config() -> HackBotConfig:
         ui=UIConfig(**merged.get("ui", {})),
         telegram=TelegramConfig(**merged.get("telegram", {})),
         rag=RAGConfig(**merged.get("rag", {})),
+        scope=ScopeConfig(**merged.get("scope", {})),
+        validation=ValidationConfig(**merged.get("validation", {})),
     )
     return cfg
 
@@ -444,6 +480,19 @@ def save_config(cfg: HackBotConfig) -> None:
             "max_context_tokens": cfg.rag.max_context_tokens,
             "chunk_size": cfg.rag.chunk_size,
             "chunk_overlap": cfg.rag.chunk_overlap,
+        },
+        "scope": {
+            "enforce": cfg.scope.enforce,
+            "file": cfg.scope.file,
+            "auto_from_target": cfg.scope.auto_from_target,
+            "audit_log": cfg.scope.audit_log,
+            "escalation_gate": cfg.scope.escalation_gate,
+            "sample_limit": cfg.scope.sample_limit,
+        },
+        "validation": {
+            "handoff_dir": cfg.validation.handoff_dir,
+            "validator_path": cfg.validation.validator_path,
+            "gotchas_path": cfg.validation.gotchas_path,
         },
     }
     with open(CONFIG_FILE, "w") as f:

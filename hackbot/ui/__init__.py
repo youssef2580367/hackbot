@@ -224,8 +224,10 @@ def print_step(step_num: int, description: str) -> None:
 
 def confirm_action(command: str, reason: str) -> bool:
     """Ask user to confirm a risky action."""
-    console.print(f"\n[warning]⚠️  {reason}[/]")
-    console.print(f"  Command: [bold]{command}[/]")
+    from rich.markup import escape
+
+    console.print(f"\n[warning]⚠️  {escape(reason)}[/]")
+    console.print(f"  Command: [bold]{escape(command)}[/]")
     try:
         response = console.input("[prompt]Execute? (y/N): [/]").strip().lower()
         return response in ("y", "yes")
@@ -249,6 +251,13 @@ def show_help() -> None:
   [tool]/run[/] <command>     Execute a security tool manually
   [tool]/step[/]              Execute next agent step
   [tool]/findings[/]          Show discovered findings
+  [tool]/proof[/] [n]         Proof-gate checks (CONFIRMED vs UNVERIFIED LEAD)
+  [tool]/attest[/] <n> <file> Attach a recorded Burp/HAR/screenshot to finding n
+  [tool]/replay[/] <n>        Controlled replay of finding n's evidence (gated)
+  [tool]/prevalidate[/] [n]   Offline 7-Question Gate (your validator.md + ywh gotchas)
+  [tool]/handoff[/] <n> [dir] Export packet → Claude Code /hackbot-validate
+  [tool]/review[/] [n] [decision] [note]  False-positive review (nothing is deleted)
+  [tool]/scope[/] [check <cmd>] Show enforced scope / test a command against it
   [tool]/stop[/]              Stop current assessment
 
 [bold]Session:[/]

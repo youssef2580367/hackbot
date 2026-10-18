@@ -53,7 +53,10 @@ def test_finding_creation():
 
     d = finding.to_dict()
     assert d["severity"] == "High"
-    assert d["title"] == "SQL Injection"
+    # No proof-gate evaluation yet → it is an unverified lead and labelled so.
+    assert d["raw_title"] == "SQL Injection"
+    assert d["title"] == "[UNVERIFIED LEAD] SQL Injection"
+    assert d["verification"] == "lead"
 
 
 @pytest.fixture

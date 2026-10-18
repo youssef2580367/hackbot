@@ -411,6 +411,7 @@ def api_agent_start():
     data = request.json or {}
     target = data.get("target", "").strip()
     scope = data.get("scope", "")
+    scope_file = data.get("scope_file", "")
     instructions = data.get("instructions", "")
 
     if not target:
@@ -445,7 +446,11 @@ def api_agent_start():
 
         def run_agent():
             try:
-                agent.start(target, scope=scope, instructions=instructions)
+                msg = agent.start(
+                    target, scope=scope, instructions=instructions, scope_file=scope_file,
+                )
+                if not agent.is_running and msg.startswith("⛔"):
+                    token_queue.put(("token", msg))
             except Exception as e:
                 token_queue.put(("token", f"\n\n**Error:** {str(e)}"))
             finally:
@@ -623,6 +628,22 @@ def api_agent_findings():
         "target": agent.target,
         "is_running": agent.is_running,
     })
+
+
+@app.route("/api/agent/findings/<int:index>/review", methods=["POST"])
+def api_agent_review(index: int):
+    """Record a human false-positive review for finding *index* (0-based)."""
+    agent: Optional[AgentMode] = _state["agent"]
+    if not agent or not 0 <= index < len(agent.findings):
+        return jsonify({"error": "No such finding"}), 404
+    data = request.json or {}
+    try:
+        finding = agent.review_finding(index, str(data.get("decision", "")),
+                                       str(data.get("note", "")))
+    except ValueError:
+        return jsonify({"error": "decision must be valid, false_positive or "
+                                 "needs_more_evidence"}), 400
+    return jsonify({"ok": True, "finding": finding.to_dict()})
 
 
 @app.route("/api/agent/scripts")

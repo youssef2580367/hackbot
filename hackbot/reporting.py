@@ -260,6 +260,9 @@ def calculate_security_posture(findings: List[Dict[str, Any]]) -> Dict[str, Any]
     """
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for f in findings:
+        # Unverified leads are not vulnerabilities; they never move the score.
+        if f.get("verification", "confirmed") != "confirmed" or f.get("dismissed"):
+            continue
         sev = str(f.get("severity", "Info")).strip().capitalize()
         if sev not in counts:
             sev = "Info"
@@ -301,7 +304,8 @@ def calculate_security_posture(findings: List[Dict[str, Any]]) -> Dict[str, Any]
         + counts["Medium"] * 4.0
         + counts["Low"] * 1.5
     )
-    risk_index = round(min(10.0, weighted_sum / max(1, len(findings))), 1) if findings else 0.0
+    counted = sum(counts.values())
+    risk_index = round(min(10.0, weighted_sum / max(1, counted)), 1) if counted else 0.0
 
     remediation_hours = (
         counts["Critical"] * 16
