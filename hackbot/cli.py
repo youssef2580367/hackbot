@@ -197,6 +197,8 @@ class HackBotApp:
             "/diff": lambda: self._diff_command(args),
             "/bola": lambda: self._bola_command(args),
             "/bfla": lambda: self._bfla_command(args),
+            "/tenants": lambda: self._tenants_command(args),
+            "/session": lambda: self._session_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -501,6 +503,55 @@ class HackBotApp:
             "inventory_only": "--inventory" in parts,
             "discover_siblings": "--no-options" not in parts})
         console.print(Markdown(text))
+        return True
+
+    def _tenants_command(self, args: str) -> bool:
+        """/tenants [--plan] — cross-tenant leak scan."""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        console.print(Markdown(self.agent._process_tenant_action(
+            {"plan_only": "--plan" in args.split()})))
+        return True
+
+    def _session_command(self, args: str) -> bool:
+        """/session begin <id> [exchange #] | event <id> <type> [note] | verify <id> | status"""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        parts = args.split(maxsplit=3)
+        sub = parts[0] if parts else "status"
+        try:
+            if sub == "begin" and len(parts) >= 2:
+                t = self.agent.session_begin(
+                    parts[1], int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None)
+                if t["verdict"] == "inconclusive":
+                    print_error(t["detail"])
+                else:
+                    print_success(f"{parts[1]}'s current credentials work (step "
+                                  f"{t['before_step']}, marker {t['marker']!r}) and were saved "
+                                  f"as {t['retired']}.")
+                    print_info("Now, in the app, change the password / log out / downgrade the "
+                               "role, record it (screenshot or request), then:\n"
+                               f"  /session event {parts[1]} <password_change|logout|"
+                               "role_downgrade|account_disabled|token_revoked> [note]")
+            elif sub == "event" and len(parts) >= 3:
+                t = self.agent.session_event(parts[1], parts[2],
+                                             parts[3] if len(parts) > 3 else "")
+                print_success(f"Event recorded: {t['event']}. Next: /session verify {parts[1]}")
+            elif sub == "verify" and len(parts) >= 2:
+                t = self.agent.session_verify(parts[1])
+                print_info(f"{t['verdict'].upper()}: {t['detail']}")
+                if t.get("finding"):
+                    console.print(Markdown(t["finding"]))
+                    print_info("Attach the recording of the event: /attest <n> <file>")
+            else:
+                for name, t in self.agent.sessions.tests.items():
+                    print_info(f"{name}: {t.verdict} {t.event or ''} {t.detail}")
+                print_info("Usage: /session begin <identity> [exchange #] | event <identity> "
+                           "<type> [note] | verify <identity>")
+        except (ValueError, KeyError) as exc:
+            print_error(str(exc))
         return True
 
     def _identities_command(self, args: str) -> bool:

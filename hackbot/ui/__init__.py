@@ -263,6 +263,8 @@ def show_help() -> None:
   [tool]/diff[/] <exchange #> [ids]  Replay a request as other identities (BOLA/BFLA)
   [tool]/bola[/] [exchange #] [--plan]  Ownership-aware object-ID substitution (IDOR)
   [tool]/bfla[/] [--inventory] [--no-options]  Function inventory + role × function matrix
+  [tool]/tenants[/] [--plan]   Cross-tenant data in identities' own responses
+  [tool]/session[/] begin|event|verify <id>  Old token still valid after password change/logout?
   [tool]/stop[/]              Stop current assessment
 
 [bold]Session:[/]

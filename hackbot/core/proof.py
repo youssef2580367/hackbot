@@ -62,6 +62,9 @@ REQUIRES_RECORDED_PROOF: Dict[str, str] = {
     "race condition": "the duplicated effect (e.g. double redemption) must be recorded",
     "business logic": "the end state proving the abuse (balance, order, entitlement) "
                       "must be recorded",
+    "session management": "the lifecycle event itself (password change / logout / role "
+                          "change) must be recorded so the before → event → after timeline "
+                          "is provable",
 }
 
 _CLASS_KEYWORDS = {
@@ -70,6 +73,8 @@ _CLASS_KEYWORDS = {
     "clickjacking": ("clickjacking", "ui redress"),
     "race condition": ("race condition", "toctou"),
     "business logic": ("business logic",),
+    "session management": ("session management", "session not invalidated",
+                           "not invalidated after", "privileges not revoked"),
 }
 
 

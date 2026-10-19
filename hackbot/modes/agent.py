@@ -32,6 +32,9 @@ from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.core.authz_diff import AuthzDiff
 from hackbot.core.bfla import BflaTester, render_matrix
 from hackbot.core.bola import BolaTester
+from hackbot.core.boundaries import annotate_boundary
+from hackbot.core.session_lifecycle import SessionLifecycle
+from hackbot.core.tenancy import TenantScanner
 from hackbot.core.corpus import Corpus
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
 from hackbot.core.identities import IdentityError, IdentityVault
@@ -93,6 +96,9 @@ class Finding:
     victim_identifier: str = ""
     chained_with: List[str] = field(default_factory=list)
     validation: Dict[str, Any] = field(default_factory=dict)
+    boundary_type: str = ""
+    attacker_tenant: str = ""
+    victim_tenant: str = ""
     # ── False-positive screen (machine label + human review) ────────────
     fp_triage: Dict[str, Any] = field(default_factory=dict)
     db_id: Optional[int] = None
@@ -143,6 +149,9 @@ class Finding:
             "victim_identifier": self.victim_identifier,
             "chained_with": self.chained_with,
             "validation": self.validation,
+            "boundary_type": self.boundary_type,
+            "attacker_tenant": self.attacker_tenant,
+            "victim_tenant": self.victim_tenant,
             "fp_triage": self.fp_triage,
             "dismissed": self.dismissed,
             "db_id": self.db_id,
@@ -247,6 +256,7 @@ class AgentMode:
         self.program_rules: Optional[ProgramRules] = None
         self.identity_vault: Optional[IdentityVault] = None
         self.corpus: Corpus = Corpus()
+        self.sessions = SessionLifecycle()
         self._validator: Optional[FindingValidator] = None
 
         self.conversation: Optional[Conversation] = None
@@ -841,6 +851,8 @@ Explain your reasoning at each step."""
                     results_text.append(self._process_bola_action(action))
                 elif atype == "bfla_scan":
                     results_text.append(self._process_bfla_action(action))
+                elif atype == "tenant_scan":
+                    results_text.append(self._process_tenant_action(action))
                 elif atype == "analyze_anomaly":
                     anomaly_result = self._process_anomaly_action(action)
                     results_text.append(anomaly_result)
@@ -1297,6 +1309,7 @@ Explain your reasoning at each step."""
         out["findings"] = []
         if record and not plan.refused:
             for act in engine.finding_actions(plan):
+                annotate_boundary(act, self.identity_vault)
                 out["findings"].append(self._record_finding(act))
         return out
 
@@ -1314,7 +1327,8 @@ Explain your reasoning at each step."""
             tester.run(report)
         out: Dict[str, Any] = report.to_dict()
         out["findings"] = [] if plan_only else [
-            self._record_finding(act) for act in tester.finding_actions(report)]
+            self._record_finding(annotate_boundary(act, self.identity_vault))
+            for act in tester.finding_actions(report)]
         return out
 
     def bfla_scan(self, max_functions: int = 20, discover_siblings: bool = True,
@@ -1336,7 +1350,8 @@ Explain your reasoning at each step."""
         rows = tester.matrix(functions, max_functions=max_functions)
         out["matrix"] = [r.to_dict() for r in rows]
         out["table"] = render_matrix(rows, self.identity_vault.names())
-        out["findings"] = [self._record_finding(a) for a in tester.finding_actions(rows)]
+        out["findings"] = [self._record_finding(annotate_boundary(a, self.identity_vault))
+                           for a in tester.finding_actions(rows)]
         return out
 
     def _process_bfla_action(self, action: Dict[str, Any]) -> str:
@@ -1358,6 +1373,51 @@ Explain your reasoning at each step."""
             lines += ["", result["table"]]
         lines.extend(result["findings"])
         return "\n".join(lines)
+
+    def tenant_scan(self, confirm: bool = True) -> Dict[str, Any]:
+        """Cross-tenant leaks in identities' own responses; confirmed ones become findings."""
+        if self.identity_vault is None:
+            return {"refused": "load an identities file first (/identities load <file>)"}
+        scanner = TenantScanner(self.corpus, self.identity_vault, self.run_recorded)
+        leads = scanner.leads()
+        if confirm:
+            scanner.confirm(leads)
+        return {"leads": [lead.to_dict() for lead in leads],
+                "findings": [self._record_finding(annotate_boundary(a, self.identity_vault))
+                             for a in scanner.finding_actions(leads)] if confirm else []}
+
+    def _process_tenant_action(self, action: Dict[str, Any]) -> str:
+        result = self.tenant_scan(confirm=not action.get("plan_only", False))
+        if result.get("refused"):
+            return f"**[tenant_scan]** REFUSED: {result['refused']}"
+        lines = [f"**[tenant_scan]** {len(result['leads'])} cross-tenant lead(s)"]
+        for lead in result["leads"]:
+            lines.append(f"- #{lead['exchange_id']} {lead['method']} {lead['template']}: "
+                         f"{lead['identity']} ({lead['tenant']}) saw {lead['victim']}'s "
+                         f"{lead['marker']!r} ({lead['victim_tenant']}) → {lead['status']}"
+                         + (f" (step {lead['step']})" if lead["step"] else ""))
+        lines.extend(result["findings"])
+        return "\n".join(lines)
+
+    # ── session lifecycle (the event itself is always performed by the hunter) ──
+    def session_begin(self, identity: str, exchange_id: Optional[int] = None) -> Dict[str, Any]:
+        if self.identity_vault is None:
+            raise ValueError("load an identities file first")
+        return self.sessions.begin(self.identity_vault, self.corpus, self.run_recorded,
+                                   identity, exchange_id).to_dict()
+
+    def session_event(self, identity: str, event: str, note: str = "") -> Dict[str, Any]:
+        return self.sessions.record_event(identity, event, note).to_dict()
+
+    def session_verify(self, identity: str) -> Dict[str, Any]:
+        if self.identity_vault is None:
+            raise ValueError("load an identities file first")
+        test = self.sessions.verify(self.identity_vault, self.run_recorded, identity)
+        out = test.to_dict()
+        act = self.sessions.finding_action(test, self.identity_vault)
+        out["finding"] = self._record_finding(annotate_boundary(act, self.identity_vault)) \
+            if act else ""
+        return out
 
     def _process_bola_action(self, action: Dict[str, Any]) -> str:
         try:
@@ -1593,8 +1653,10 @@ Explain your reasoning at each step."""
                             str(action.get("victim_identity", "")))
         if key is None:
             return None
+        key += (str(action.get("boundary_type", "")),)
         for f in self.findings:
-            if self._bug_key(f.vuln_class, f.asset, f.attacker_identity, f.victim_identity) == key:
+            other = self._bug_key(f.vuln_class, f.asset, f.attacker_identity, f.victim_identity)
+            if other is not None and other + (f.boundary_type,) == key:
                 return f
         return None
 
@@ -1784,7 +1846,8 @@ Explain your reasoning at each step."""
             for attr in ("description", "evidence", "recommendation", "behavior",
                          "boundary", "impact", "vuln_class", "reproduction", "asset",
                          "privileges_required", "attacker_identity", "victim_identity",
-                         "victim_identifier"):
+                         "victim_identifier", "boundary_type", "attacker_tenant",
+                         "victim_tenant"):
                 val = action.get(attr)
                 if val:
                     setattr(finding, attr, str(val))
@@ -1810,6 +1873,9 @@ Explain your reasoning at each step."""
                 victim_identity=str(action.get("victim_identity", "")),
                 victim_identifier=str(action.get("victim_identifier", "")),
                 chained_with=list(action.get("chained_with") or []),
+                boundary_type=str(action.get("boundary_type", "")),
+                attacker_tenant=str(action.get("attacker_tenant", "")),
+                victim_tenant=str(action.get("victim_tenant", "")),
             )
             self.findings.append(finding)
 

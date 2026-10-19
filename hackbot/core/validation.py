@@ -84,7 +84,11 @@ _NEVER_SUBMIT_MATCHERS: List[Tuple[str, str, str]] = [
     ("host header", r"host header injection", r"password reset|poison(ed|ing)"),
     ("rate limit", r"\brate[- ]limit",
      r"\b(otp|2fa|mfa|password reset|coupon|gift|voucher|redeem|transfer)\b"),
-    ("not invalidated", r"session (is )?not invalidated|not invalidated on logout", ""),
+    # Logout only: a session surviving a *password change* or role downgrade is
+    # a different, usually accepted, finding.
+    ("not invalidated",
+     r"(not invalidated|still valid|remains valid|still accepted)\W+(\w+\W+){0,4}"
+     r"(on|after) logout|logout\W+(\w+\W+){0,4}(not invalidated|still valid)", ""),
     ("concurrent sessions", r"concurrent sessions?", ""),
     ("internal ip", r"internal ip", ""),
     ("cookie flags", r"cookie (flag|attribute)s?|missing (httponly|secure) flag", ""),
@@ -425,6 +429,13 @@ class FindingValidator:
             return QuestionResult("Q6", "fail", "impact not demonstrated by verified evidence")
 
         low = text.lower()
+        if finding.get("boundary_type") == "tenant_isolation":
+            at, vt = str(finding.get("attacker_tenant", "")), str(finding.get("victim_tenant", ""))
+            if not at or not vt or at == vt:
+                return QuestionResult(
+                    "Q6", "fail",
+                    "tenant isolation claimed but attacker and victim are not in two "
+                    "distinct tenants in the identity vault")
         if any(c in low for c in AUTH_CLASSES):
             a = str(finding.get("attacker_identity", "")).strip()
             b = str(finding.get("victim_identity", "")).strip()

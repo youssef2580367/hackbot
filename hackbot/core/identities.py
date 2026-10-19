@@ -131,14 +131,26 @@ class IdentityVault:
             )
         self.identities = dict(identities)
         self.identities.setdefault(ANONYMOUS, Identity(name=ANONYMOUS, role="anonymous"))
+        # Snapshots of an identity's earlier credentials (session-lifecycle tests).
+        # Usable in placeholders and redacted, but not test identities themselves.
+        self.retired: Dict[str, Identity] = {}
         self.max_identities = max_identities
         self.source = source
         self.role_ranks = dict(DEFAULT_ROLE_RANKS)
         self.role_ranks.update({str(k).lower(): int(v) for k, v in (roles or {}).items()})
+        self._rebuild_secrets()
+
+    def _rebuild_secrets(self) -> None:
+        everyone = list(self.identities.values()) + list(self.retired.values())
         self._secrets = sorted(
-            (s for ident in self.identities.values() for s in ident.secrets()),
+            (s for ident in everyone for s in ident.secrets()),
             key=lambda s: len(s[1]), reverse=True,
         )
+
+    def add_retired(self, ident: Identity) -> None:
+        """Keep an earlier credential set under its own name (e.g. ``user-a.before``)."""
+        self.retired[ident.name] = ident
+        self._rebuild_secrets()
 
     # ── loading ──────────────────────────────────────────────────────────
     @classmethod
@@ -180,10 +192,10 @@ class IdentityVault:
 
     # ── lookup ───────────────────────────────────────────────────────────
     def get(self, name: str) -> Identity:
-        try:
-            return self.identities[name]
-        except KeyError:
-            raise IdentityError(f"unknown identity {name!r}") from None
+        ident = self.identities.get(name) or self.retired.get(name)
+        if ident is None:
+            raise IdentityError(f"unknown identity {name!r}")
+        return ident
 
     def names(self) -> List[str]:
         return list(self.identities)
@@ -232,7 +244,7 @@ class IdentityVault:
     def check_placeholders(self, text: str) -> Optional[str]:
         """Return an error message if *text* references unknown credentials."""
         for kind, name, header in self.placeholders_in(text):
-            ident = self.identities.get(name)
+            ident = self.identities.get(name) or self.retired.get(name)
             if ident is None:
                 return f"unknown identity {name!r} in placeholder"
             if kind == "cookie" and not ident.cookies:
