@@ -211,6 +211,19 @@ class BflaTester:
                 base.detail = ("privileged response contains no other identity's markers — "
                                "exposure can't be proven from data on this function")
             top_rank = self.vault.rank(top)
+            lowest_auth = min(self.vault.rank(n) for n in self._authenticated())
+            if top_rank == lowest_auth and "administrative" in fn.reason:
+                # No higher role exists to compare with: the baseline caller IS the
+                # lowest authenticated role. Reaching an admin-named function and
+                # receiving other identities' data is the BFLA evidence itself.
+                v = Variant(identity=top, command=base.command, step=base.step)
+                self.diff.judge(v, raw, resp.body, "administrative function", row.markers)
+                if v.verdict == "exposed":
+                    v.detail = (f"{top} (lowest role {self.vault.get(top).role!r}) received "
+                                f"other identities' data ({v.owner_marker!r}) from an "
+                                "administrative function")
+                    row.cells[top] = v
+                    row.note = "lowest role reaches administrative function"
             for name in self.vault.names():
                 if name == top or self.vault.rank(name) >= top_rank:
                     continue
@@ -233,24 +246,32 @@ class BflaTester:
                 victim = self.vault.identity_for_marker(v.owner_marker) or ""
                 attacker_role = self.vault.get(name).role
                 anon = name == ANONYMOUS
+                self_baseline = name == base.identity
                 out.append({
                     "action": "finding",
                     "title": (f"{'Auth bypass' if anon else 'BFLA'}: {fn.method} {fn.template} "
-                              f"({base.identity}-only function) callable by {name}"),
+                              + ("(administrative function)" if self_baseline
+                                 else f"({base.identity}-only function)")
+                              + f" callable by {name}"),
                     "severity": "Medium",
                     "vuln_class": "auth bypass" if anon else "bfla",
                     "asset": row.url,
                     "behavior": (f"{fn.method} {fn.template} — {fn.reason} — returned HTTP "
                                  f"{v.status} to {name} (step {v.step}) containing "
-                                 f"{v.owner_marker!r}, the same data the privileged baseline as "
-                                 f"{base.identity} returned (step {base.step})"),
+                                 f"{v.owner_marker!r}"
+                                 + ("" if self_baseline else
+                                    f", the same data the privileged baseline as "
+                                    f"{base.identity} returned (step {base.step})")),
                     "boundary": ("authentication on an administrative function" if anon else
                                  f"function-level authorization: role {attacker_role!r} invoked "
-                                 f"a function reserved for {self.vault.get(base.identity).role!r}"),
+                                 + ("an administrative function" if self_baseline else
+                                    f"a function reserved for "
+                                    f"{self.vault.get(base.identity).role!r}")),
                     "impact": (f"{name} received privileged data from {fn.template} including "
                                f"{victim or 'another identity'}'s {v.owner_marker}"),
                     "evidence_refs": [{"step": v.step, "excerpt": v.excerpt, "supports": "both"}],
-                    "reproduction": (f"privileged baseline: {base.command}\n"
+                    "reproduction": (v.command if self_baseline else
+                                     f"privileged baseline: {base.command}\n"
                                      f"low-privilege: {v.command}"),
                     "attacker_identity": name,
                     "victim_identity": victim,

@@ -227,3 +227,54 @@ def test_requires_identities():
     with patch("hackbot.core.vulndb.VulnDB"), patch("hackbot.core.cve.CVELookup"):
         a = AgentMode(engine=MagicMock(spec=AIEngine), config=config)
     assert "identities" in a.bfla_scan()["refused"]
+
+
+def test_lowest_role_reaching_admin_function_is_bfla(vault, monkeypatch):
+    """No admin identity: a plain user calling an admin-named function and receiving
+    other users' data is the evidence itself (crAPI /management/users/all)."""
+    from hackbot.modes.agent import AgentMode
+
+    users_only = IdentityVault.from_dict({"identities": {
+        "user-a": {"role": "user", "cookies": {"session": A_SESSION},
+                   "markers": ["hunter-a@example.com"]},
+        "user-b": {"role": "user", "cookies": {"session": B_SESSION},
+                   "markers": ["hunter-b@example.com"]},
+    }})
+    config = HackBotConfig()
+    config.ai = AIConfig(provider="mock", model="mock")
+    config.agent = AgentConfig(allowed_tools=["curl"], safe_mode=True)
+    config.scope = ScopeConfig(audit_log=False)
+    with patch("hackbot.core.vulndb.VulnDB"), patch("hackbot.core.cve.CVELookup"):
+        a = AgentMode(engine=MagicMock(spec=AIEngine), config=config)
+    a._assessment_id, a._rag_enabled, a.target = None, False, "api.example.com"
+    a.scope_policy = a.runner.scope_policy = ScopePolicy(in_scope=["api.example.com"])
+    a.identity_vault = a.runner.identity_vault = users_only
+    a.corpus = Corpus(scope_policy=a.scope_policy, identity_vault=users_only)
+    a.corpus.add("openapi", "GET", "https://api.example.com/v1/management/users/all",
+                 attribute=False)
+    _serve(monkeypatch, lambda argv: http(200, USERS) if (A_SESSION in argv or B_SESSION in argv)
+           else http(401, '{"error": "unauthorized"}'))
+    out = a.bfla_scan(discover_siblings=False)
+    row = out["matrix"][0]
+    assert row["note"] == "lowest role reaches administrative function"
+    top = row["baseline"]["identity"]
+    assert row["cells"][top]["verdict"] == "exposed"
+    f = a.findings[0]
+    assert f.confirmed and f.vuln_class == "bfla"
+    assert "(administrative function)" in f.title
+    assert f.victim_identity != f.attacker_identity
+    assert f.validation["verdict"] == "ready_for_validator", f.validation
+
+
+def test_lowest_role_rule_needs_an_admin_named_path(vault, monkeypatch):
+    """Privileged-by-observation functions still need a higher role to compare with."""
+    users_only = IdentityVault.from_dict({"identities": {
+        "user-a": {"role": "user", "cookies": {"session": A_SESSION},
+                   "markers": ["hunter-a@example.com"]}}})
+    c = Corpus(identity_vault=users_only)
+    c.add("har", "GET", "https://api.example.com/v1/reports/7",
+          {"Cookie": f"session={A_SESSION}"}, "", 200, {}, USERS)
+    calls = []
+    t = BflaTester(c, users_only, lambda cmd, e: (calls.append(cmd) or 1, http(200, USERS)))
+    rows = t.matrix(t.inventory())
+    assert all(not r.cells for r in rows)

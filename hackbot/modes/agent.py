@@ -1570,6 +1570,34 @@ Explain your reasoning at each step."""
                 obs.append(o)
         return obs
 
+    @staticmethod
+    def _bug_key(vuln_class: str, asset: str, attacker: str, victim: str) -> Optional[tuple]:
+        """(class, host, endpoint template) for authorization findings with both identities.
+
+        Both directions (A→B, B→A) and both engines (/diff, /bola) on the same
+        endpoint are one vulnerability.
+        """
+        if not (vuln_class and asset and attacker and victim):
+            return None
+        from urllib.parse import urlsplit
+
+        from hackbot.core.corpus import path_template
+
+        parts = urlsplit(asset)
+        return (vuln_class.lower(), parts.hostname or "", path_template(parts.path or "/")[0])
+
+    def _find_same_bug(self, action: Dict[str, Any]) -> Optional[Finding]:
+        """Engine-generated duplicates (/diff and /bola hitting the same object path)."""
+        key = self._bug_key(str(action.get("vuln_class", "")), str(action.get("asset", "")),
+                            str(action.get("attacker_identity", "")),
+                            str(action.get("victim_identity", "")))
+        if key is None:
+            return None
+        for f in self.findings:
+            if self._bug_key(f.vuln_class, f.asset, f.attacker_identity, f.victim_identity) == key:
+                return f
+        return None
+
     def _find_existing(self, title: str) -> Optional[Finding]:
         key = title.strip().lower()
         for f in self.findings:
@@ -1740,7 +1768,16 @@ Explain your reasoning at each step."""
         if not isinstance(refs, list):
             refs = [refs]
         existing = self._find_existing(title)
-        if existing is not None:
+        same_bug = None if existing is not None else self._find_same_bug(action)
+        if same_bug is not None:
+            # Another demonstration of an already-recorded bug (other direction or
+            # other engine): keep the finding as written, add the new evidence.
+            finding = same_bug
+            finding.evidence_refs = finding.evidence_refs + refs
+            if action.get("reproduction"):
+                finding.reproduction = (finding.reproduction + "\n\nalso reproduced as:\n"
+                                        + str(action["reproduction"])).strip()
+        elif existing is not None:
             # Same finding re-submitted with more evidence — upgrade in place.
             finding = existing
             finding.severity = severity

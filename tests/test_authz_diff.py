@@ -220,3 +220,19 @@ def test_similarity_ignores_dynamic_values():
     b = '{"id": 5, "at": "2026-10-19T11:22:33Z", "nonce": "' + "0" * 32 + '"}'
     assert normalize(a) == normalize(b)
     assert similarity(a, b) == 1.0
+
+
+def test_diff_and_bola_same_bug_is_one_finding(agent, monkeypatch):
+    _serve(monkeypatch, vulnerable)
+    agent.identity_vault.get("user-a").owned = {"order": ["5001"]}
+    agent.identity_vault.get("user-b").owned = {"order": ["5002"]}
+    agent.corpus.add("har", "GET", "https://api.example.com/v1/orders/5001",
+                     {"Cookie": f"session={A_SESSION}"}, "", 200, {}, "{}")
+    ex_b = _b_order(agent)
+    agent.authz_diff(ex_b.id, ["user-a"])
+    agent.bola_scan()
+    idor = [f for f in agent.findings if f.vuln_class == "idor"]
+    assert len(idor) == 1
+    assert len(idor[0].evidence_refs) >= 2  # evidence from both engines merged
+    assert idor[0].attacker_identity == "user-a"  # first write-up is kept
+    assert idor[0].confirmed
