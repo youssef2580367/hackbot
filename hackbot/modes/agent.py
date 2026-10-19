@@ -29,6 +29,7 @@ from hackbot.core.cve import CVELookup
 from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
+from hackbot.core.corpus import Corpus
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
 from hackbot.core.identities import IdentityError, IdentityVault
 from hackbot.core.proof import Observation, ProofGate, RecordedEvidence, Verification
@@ -242,6 +243,7 @@ class AgentMode:
         self.scope_policy: Optional[ScopePolicy] = None
         self.program_rules: Optional[ProgramRules] = None
         self.identity_vault: Optional[IdentityVault] = None
+        self.corpus: Corpus = Corpus()
         self._validator: Optional[FindingValidator] = None
 
         self.conversation: Optional[Conversation] = None
@@ -311,6 +313,7 @@ class AgentMode:
         path = path or self.config.identities.file
         self.identity_vault = IdentityVault.from_file(path) if path else None
         self.runner.identity_vault = self.identity_vault
+        self.corpus.identity_vault = self.identity_vault
         return self.identity_vault
 
     def start(self, target: str, scope: str = "", instructions: str = "", scope_file: str = "",
@@ -331,6 +334,7 @@ class AgentMode:
             self.is_running = False
             return f"⛔ Invalid scope definition: {exc}\n\nFix the scope file/rules and retry."
         self.runner.scope_policy = self.scope_policy
+        self.corpus = Corpus(scope_policy=self.scope_policy)
         try:
             self.load_identities(identities_file)
         except (OSError, IdentityError) as exc:

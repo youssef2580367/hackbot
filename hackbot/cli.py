@@ -193,6 +193,7 @@ class HackBotApp:
             "/agent": lambda: self._start_agent(args),
             "/scope": lambda: self._scope_command(args),
             "/identities": lambda: self._identities_command(args),
+            "/corpus": lambda: self._corpus_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -411,6 +412,53 @@ class HackBotApp:
             print_info(f"Enforced scope →\n{self.agent.scope_policy.summary()}")
         if self.agent.identity_vault is not None:
             print_info(f"Test identities →\n{self.agent.identity_vault.summary()}")
+        return True
+
+    def _corpus_command(self, args: str) -> bool:
+        """/corpus import <har|openapi|proxy> [file] | endpoints | ids | search <term>"""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        corpus = self.agent.corpus
+        parts = args.split()
+        sub = parts[0] if parts else ""
+        try:
+            if sub == "import" and len(parts) >= 2:
+                kind = parts[1]
+                if kind == "har" and len(parts) >= 3:
+                    n = corpus.import_har(parts[2])
+                elif kind == "openapi" and len(parts) >= 3:
+                    n = corpus.import_openapi(parts[2], parts[3] if len(parts) > 3 else "")
+                elif kind == "proxy":
+                    from hackbot.core.proxy import get_proxy_engine
+                    n = corpus.import_proxy(get_proxy_engine())
+                else:
+                    print_info("Usage: /corpus import har <file> | openapi <file> [base_url] | proxy")
+                    return True
+                print_success(f"Imported {n} exchange(s); dropped "
+                              f"{corpus.dropped_out_of_scope} out-of-scope so far")
+                return True
+        except (OSError, ValueError) as exc:
+            print_error(f"Import failed: {exc}")
+            return True
+        if sub == "ids":
+            for c in corpus.id_candidates()[:100]:
+                console.print(f"#{c['exchange']} {c['method']} {c['template']} {c['location']}:"
+                              f"{c['param']}={c['value']} ({c['type']}) sent_by={c['sent_by'] or '?'}"
+                              f" owner={c['owner'] or '?'}", markup=False, highlight=False)
+            return True
+        if sub == "search" and len(parts) > 1:
+            for e in corpus.search(" ".join(parts[1:]))[:50]:
+                console.print(f"#{e.id} {e.method} {e.url} [{e.status}] as {e.identity or '?'}",
+                              markup=False, highlight=False)
+            return True
+        eps = corpus.endpoints()
+        for ep in eps[:200]:
+            console.print(f"{ep['method']:6} {ep['host']}{ep['template']}  x{ep['count']} "
+                          f"ids={','.join(ep['identities']) or '-'} status={ep['statuses']}",
+                          markup=False, highlight=False)
+        print_info(f"{len(corpus.exchanges)} exchanges, {len(eps)} endpoints. "
+                   "Usage: /corpus import|endpoints|ids|search")
         return True
 
     def _identities_command(self, args: str) -> bool:
