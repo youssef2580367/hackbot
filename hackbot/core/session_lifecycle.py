@@ -174,8 +174,9 @@ class SessionLifecycle:
             "boundary_type": "session_lifecycle",
             "asset": test.url,
             "behavior": (f"{test.identity}'s credentials worked before the event (step "
-                         f"{test.before_step}, HTTP {test.before_status}); the hunter recorded a "
-                         f"{test.event.replace('_', ' ')} at {when}; the same credentials then "
+                         f"{test.before_step}, HTTP {test.before_status}); a "
+                         f"{test.event.replace('_', ' ')} was recorded at {when}; the same "
+                         f"credentials then "
                          f"returned HTTP {test.after_status} with {test.identity}'s marker "
                          f"(step {test.after_step})"),
             "boundary": f"session invalidation on {test.event.replace('_', ' ')}",
