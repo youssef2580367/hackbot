@@ -258,6 +258,7 @@ def show_help() -> None:
   [tool]/handoff[/] <n> [dir] Export packet → Claude Code /hackbot-validate
   [tool]/review[/] [n] [decision] [note]  False-positive review (nothing is deleted)
   [tool]/scope[/] [check <cmd>] Show enforced scope / test a command against it
+  [tool]/identities[/] [load <f>] Test identities for multi-account testing (no secrets shown)
   [tool]/stop[/]              Stop current assessment
 
 [bold]Session:[/]

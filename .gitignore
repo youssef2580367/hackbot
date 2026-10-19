@@ -19,3 +19,10 @@ build/
 *~
 update/
 public/nvd api.txt
+
+# HUNTIX: local hunt data that must never be committed
+identities*.yaml
+identities*.yml
+*.identities.yaml
+hackbot-findings/
+scope_audit.jsonl

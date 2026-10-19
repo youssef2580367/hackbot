@@ -192,6 +192,7 @@ class HackBotApp:
             "/chat": lambda: self._switch_mode("chat"),
             "/agent": lambda: self._start_agent(args),
             "/scope": lambda: self._scope_command(args),
+            "/identities": lambda: self._identities_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -350,7 +351,8 @@ class HackBotApp:
         show_mode(mode)
         return True
 
-    def _start_agent(self, target: str, scope: str = "", scope_file: str = "") -> bool:
+    def _start_agent(self, target: str, scope: str = "", scope_file: str = "",
+                     identities_file: str = "") -> bool:
         if not target:
             print_error("Usage: /agent <target>  (e.g., /agent 192.168.1.1)")
             return True
@@ -400,12 +402,34 @@ class HackBotApp:
         console.print(f"\n[agent]HackBot Agent:[/]")
         response = self.agent.start(
             actual_target, scope=scope, instructions=instructions, scope_file=scope_file,
+            identities_file=identities_file,
         )
         console.print()
         if not self.agent.is_running and response.startswith("⛔"):
             print_error(response)
         elif self.agent.scope_policy is not None:
             print_info(f"Enforced scope →\n{self.agent.scope_policy.summary()}")
+        if self.agent.identity_vault is not None:
+            print_info(f"Test identities →\n{self.agent.identity_vault.summary()}")
+        return True
+
+    def _identities_command(self, args: str) -> bool:
+        """/identities [load <file>] — show or load test identities (never shows secrets)."""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        sub, _, rest = args.strip().partition(" ")
+        if sub == "load" and rest:
+            try:
+                self.agent.load_identities(rest.strip())
+            except (OSError, ValueError) as exc:
+                print_error(f"Cannot load identities: {exc}")
+                return True
+        vault = self.agent.identity_vault
+        if vault is None:
+            print_info("No identities loaded. /identities load <file.yaml>")
+        else:
+            console.print(vault.summary(), markup=False, highlight=False)
         return True
 
     def _scope_command(self, args: str) -> bool:
@@ -2788,15 +2812,18 @@ def main(ctx, model, provider, api_key, base_url, no_banner, verbose, safe_mode,
               help="Assessment scope: free text, or enforced rules like '*.example.com,!admin.example.com'")
 @click.option("--scope-file", "-S", default="",
               help="Enforced scope file (YAML in_scope/out_of_scope, or one rule per line, '!' = excluded)")
+@click.option("--identities", "-I", "identities_file", default="",
+              help="Test identities YAML (hunter-owned accounts; credentials stay local)")
 @click.option("--instructions", "-i", default="", help="Additional instructions")
 @click.pass_context
-def agent(ctx, target, scope, scope_file, instructions):
+def agent(ctx, target, scope, scope_file, identities_file, instructions):
     """Start an autonomous security assessment."""
     config = ctx.obj["config"]
     show_banner(small=True)
 
     app = HackBotApp(config)
-    app._start_agent(target, scope=scope, scope_file=scope_file)
+    app._start_agent(target, scope=scope, scope_file=scope_file,
+                     identities_file=identities_file)
 
     # Enter agent REPL
     _mode_repl(app, "agent")

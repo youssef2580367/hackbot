@@ -415,6 +415,7 @@ def api_agent_start():
     target = data.get("target", "").strip()
     scope = data.get("scope", "")
     scope_file = data.get("scope_file", "")
+    identities_file = data.get("identities_file", "")
     instructions = data.get("instructions", "")
 
     if not target:
@@ -452,6 +453,7 @@ def api_agent_start():
             try:
                 msg = agent.start(
                     target, scope=scope, instructions=instructions, scope_file=scope_file,
+                    identities_file=identities_file,
                 )
                 if not agent.is_running and msg.startswith("⛔"):
                     token_queue.put(("token", msg))

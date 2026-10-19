@@ -46,6 +46,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "temperature": 0.2,
         "max_tokens": 4096,
     },
+    "identities": {
+        "file": "",
+    },
     "validation": {
         "handoff_dir": "",
         "validator_path": "",
@@ -232,6 +235,12 @@ class ScopeConfig:
 
 
 @dataclass
+class IdentitiesConfig:
+    """Local file with test identities (credentials never leave it)."""
+    file: str = ""
+
+
+@dataclass
 class ValidationConfig:
     """Pre-validation rule sources and the Claude Code handoff directory."""
     handoff_dir: str = ""      # "" → ./hackbot-findings
@@ -279,6 +288,7 @@ class HackBotConfig:
     rag: RAGConfig = field(default_factory=RAGConfig)
     scope: ScopeConfig = field(default_factory=ScopeConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    identities: IdentitiesConfig = field(default_factory=IdentitiesConfig)
 
 
 def reconcile_keys(ai: Dict[str, Any]) -> None:
@@ -431,6 +441,7 @@ def load_config() -> HackBotConfig:
         rag=RAGConfig(**merged.get("rag", {})),
         scope=ScopeConfig(**merged.get("scope", {})),
         validation=ValidationConfig(**merged.get("validation", {})),
+        identities=IdentitiesConfig(**merged.get("identities", {})),
     )
     return cfg
 
@@ -493,6 +504,9 @@ def save_config(cfg: HackBotConfig) -> None:
             "handoff_dir": cfg.validation.handoff_dir,
             "validator_path": cfg.validation.validator_path,
             "gotchas_path": cfg.validation.gotchas_path,
+        },
+        "identities": {
+            "file": cfg.identities.file,
         },
     }
     with open(CONFIG_FILE, "w") as f:

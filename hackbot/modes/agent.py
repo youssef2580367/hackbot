@@ -30,6 +30,7 @@ from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
+from hackbot.core.identities import IdentityError, IdentityVault
 from hackbot.core.proof import Observation, ProofGate, RecordedEvidence, Verification
 from hackbot.core.scope import ScopeAuditLog, ScopePolicy
 from hackbot.core.validation import FindingValidator, ProgramRules, RuleSet
@@ -240,6 +241,7 @@ class AgentMode:
         self.installer = ToolInstaller(self.runner)
         self.scope_policy: Optional[ScopePolicy] = None
         self.program_rules: Optional[ProgramRules] = None
+        self.identity_vault: Optional[IdentityVault] = None
         self._validator: Optional[FindingValidator] = None
 
         self.conversation: Optional[Conversation] = None
@@ -304,7 +306,15 @@ class AgentMode:
             return ScopePolicy.from_target(target)
         return None
 
-    def start(self, target: str, scope: str = "", instructions: str = "", scope_file: str = "") -> str:
+    def load_identities(self, path: str = "") -> Optional[IdentityVault]:
+        """Load the identity vault (explicit path, else config) into the runner."""
+        path = path or self.config.identities.file
+        self.identity_vault = IdentityVault.from_file(path) if path else None
+        self.runner.identity_vault = self.identity_vault
+        return self.identity_vault
+
+    def start(self, target: str, scope: str = "", instructions: str = "", scope_file: str = "",
+              identities_file: str = "") -> str:
         """
         Start a new assessment against a target.
 
@@ -321,6 +331,11 @@ class AgentMode:
             self.is_running = False
             return f"⛔ Invalid scope definition: {exc}\n\nFix the scope file/rules and retry."
         self.runner.scope_policy = self.scope_policy
+        try:
+            self.load_identities(identities_file)
+        except (OSError, IdentityError) as exc:
+            self.is_running = False
+            return f"⛔ Invalid identities file: {exc}"
         if self.scope_policy is not None:
             ok, why = self.scope_policy.check_raw_target(target)
             if not ok:
@@ -366,6 +381,9 @@ class AgentMode:
 - Enforced Scope (commands touching anything else are refused):
 {self.scope_policy.summary() if self.scope_policy else 'NOT ENFORCED (scope.enforce is off)'}
 - Impact escalation (data dumps, RCE escalation, PII, state-changing requests, brute force) requires explicit human approval; prove impact with the minimal action first.
+- Test identities (hunter-owned accounts; credentials are hidden from you):
+{self.identity_vault.summary() if self.identity_vault else 'none loaded — single-identity testing only'}
+  Authenticate as one with placeholders, e.g. curl -s -H "Cookie: {{{{cookie:user-b}}}}" URL, -H "Authorization: Bearer {{{{bearer:user-b}}}}", -H "X-Api-Key: {{{{header:admin:X-Api-Key}}}}". For authorization findings set attacker_identity / victim_identity to these names and only use object IDs the victim identity owns.
 - Safe Mode: {'Enabled' if self.config.agent.safe_mode else 'Disabled'}
 - Available Tools: {', '.join(installed) if installed else 'None detected'}
 - Unavailable Tools: {', '.join(not_installed) if not_installed else 'None'}
@@ -1427,8 +1445,21 @@ Explain your reasoning at each step."""
         )
         finding.verification = result.verification
         finding.proof = result.to_dict()
+        self._fill_victim_identifier(finding)
         self.screen_false_positive(finding)
         self.prevalidate(finding)
+
+    def _fill_victim_identifier(self, finding: Finding) -> None:
+        """Use the victim identity's own markers when they appear in verified evidence."""
+        vault = self.identity_vault
+        if vault is None or finding.victim_identifier or \
+                finding.victim_identity not in vault.identities:
+            return
+        excerpts = " ".join(r.get("excerpt", "") for r in finding.proof.get("verified_refs", []))
+        for marker in vault.get(finding.victim_identity).markers:
+            if marker and marker in excerpts:
+                finding.victim_identifier = marker
+                return
 
     def _step_outputs(self) -> Dict[int, Dict[str, str]]:
         return {

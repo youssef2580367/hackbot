@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from hackbot.config import INSTALL_DRIVERS, LOGS_DIR, resolve_tool_path
 from hackbot.core.escalation import EscalationLevel, classify as classify_escalation
+from hackbot.core.identities import IdentityVault, has_placeholders
 from hackbot.core.scope import ScopeAuditLog, ScopePolicy, ScopeVerdict
 
 # Lazy reference — filled at runtime to avoid circular imports
@@ -148,6 +149,7 @@ class ToolRunner:
         escalation_gate: bool = True,
         sample_limit: int = 1,
         on_approve: Optional[Callable[[str, str], bool]] = None,
+        identity_vault: Optional[IdentityVault] = None,
     ):
         self.allowed_tools = allowed_tools
         self.timeout = timeout
@@ -172,6 +174,10 @@ class ToolRunner:
         # Human-only approver for the gates. Deliberately separate from
         # on_confirm, which some front-ends wire to auto_confirm.
         self.on_approve = on_approve
+        # Test identities: {{cookie:NAME}} / {{bearer:NAME}} / {{header:NAME:H}}
+        # placeholders are expanded only inside argv at exec time, and every
+        # result is redacted before it is stored or returned.
+        self.identity_vault = identity_vault
 
     def _normalize_command(self, command: str) -> str:
         """Normalize AI-generated command text into an executable command string."""
@@ -736,7 +742,7 @@ class ToolRunner:
         procs: list = []
         try:
             for i, stage in enumerate(stages):
-                args = stage if is_windows else shlex.split(stage)
+                args = self._expand_str(stage) if is_windows else self._argv(stage)
                 stdin_src = procs[-1].stdout if procs else None
                 # Only the first stage may receive sudo password via stdin
                 stdin_data_for_stage = None
@@ -832,10 +838,38 @@ class ToolRunner:
                 success=False,
             )
 
+        self._redact_result(result)
         self.history.append(result)
         self._log_execution(result)
         if self.on_output:
             self.on_output(result.output)
+        return result
+
+    # ── Identity placeholders + redaction ────────────────────────────────
+
+    def _argv(self, command: str) -> List[str]:
+        """Split *command* shell-free and expand identity placeholders per token."""
+        tokens = shlex.split(command)
+        if self.identity_vault is not None:
+            tokens = [self.identity_vault.expand(t) for t in tokens]
+        return tokens
+
+    def _expand_str(self, command: str) -> str:
+        return self.identity_vault.expand(command) if self.identity_vault else command
+
+    def _placeholder_error(self, command: str) -> Optional[str]:
+        if not has_placeholders(command):
+            return None
+        if self.identity_vault is None:
+            return "identity placeholders used but no identities file is loaded"
+        return self.identity_vault.check_placeholders(command)
+
+    def _redact_result(self, result: ToolResult) -> ToolResult:
+        """Strip credential values from a result in place (and return it)."""
+        if self.identity_vault is not None:
+            result.stdout = self.identity_vault.redact(result.stdout)
+            result.stderr = self.identity_vault.redact(result.stderr)
+            result.command = self.identity_vault.redact(result.command)
         return result
 
     # ── Scope + escalation gates ─────────────────────────────────────────
@@ -923,6 +957,10 @@ class ToolRunner:
         # Scope + impact-escalation gates run before anything else,
         # plugins included. Installs (allow_install_drivers) only touch
         # package managers, not targets.
+        placeholder_err = self._placeholder_error(command)
+        if placeholder_err:
+            return self._blocked(command, tool_name, f"BLOCKED: {placeholder_err}")
+
         human_approved = False
         if not allow_install_drivers:
             refusal, human_approved = self.check_gates(command, preapproved=preapproved)
@@ -981,7 +1019,7 @@ class ToolRunner:
             proc = subprocess.Popen(
                 # Windows: pass the raw string to CreateProcess (no cmd.exe, so
                 # shell metacharacters are NOT interpreted). POSIX: split to argv.
-                command if is_windows else shlex.split(command),
+                self._expand_str(command) if is_windows else self._argv(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if stdin_data else None,
@@ -1037,6 +1075,7 @@ class ToolRunner:
             )
 
         # Log and store
+        self._redact_result(result)
         self.history.append(result)
         self._log_execution(result)
 
@@ -1048,6 +1087,10 @@ class ToolRunner:
     async def execute_async(self, command: str, tool_name: str = "") -> ToolResult:
         """Execute a command asynchronously (shell-free; parity with execute())."""
         command = self._normalize_command(command)
+
+        placeholder_err = self._placeholder_error(command)
+        if placeholder_err:
+            return self._blocked(command, tool_name, f"BLOCKED: {placeholder_err}")
 
         refusal, human_approved = self.check_gates(command)
         if refusal:
@@ -1101,7 +1144,7 @@ class ToolRunner:
 
         # Tokenize without a shell so /bin/sh is never invoked (parity with execute()).
         try:
-            args = shlex.split(command)
+            args = self._argv(command)
         except ValueError as e:
             result = ToolResult(
                 tool=self._infer_tool_name(command, tool_name),
@@ -1112,6 +1155,7 @@ class ToolRunner:
                 duration=time.time() - start,
                 success=False,
             )
+            self._redact_result(result)
             self.history.append(result)
             self._log_execution(result)
             if self.on_output:
@@ -1176,6 +1220,7 @@ class ToolRunner:
                 success=False,
             )
 
+        self._redact_result(result)
         self.history.append(result)
         self._log_execution(result)
         if self.on_output:
@@ -1300,6 +1345,7 @@ class ToolRunner:
             success=result.success,
         )
 
+        self._redact_result(tool_result)
         self.history.append(tool_result)
         self._log_execution(tool_result)
 
