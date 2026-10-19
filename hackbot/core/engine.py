@@ -245,6 +245,8 @@ You are equipped with a ZeroDayEngine that provides:
    (replays one recorded request as every other test identity and reports exposure only when the owner's markers appear; needs /identities and /corpus data)
    {"action": "bola_scan", "exchange_id": <optional corpus exchange #>, "plan_only": false, "explanation": "<why>"}
    (swaps object IDs the sending identity owns for another test identity's objects of the same type — path/query/JSON/form, parameter pollution, type juggling — and reports exposure only when the victim's markers appear)
+   {"action": "bfla_scan", "inventory_only": false, "explanation": "<why>"}
+   (builds the function inventory — privileged-only and admin-named endpoints, method siblings via OPTIONS — and a role × function matrix; exposure only when another identity's data from the privileged response reaches a lower role)
    ```
    Categories: buffer_overflow, integer_overflow, path_traversal, template_injection, ssrf, deserialization, command_injection, xss, header_injection, xxe, request_smuggling, race_condition
 

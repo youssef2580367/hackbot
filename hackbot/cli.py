@@ -196,6 +196,7 @@ class HackBotApp:
             "/corpus": lambda: self._corpus_command(args),
             "/diff": lambda: self._diff_command(args),
             "/bola": lambda: self._bola_command(args),
+            "/bfla": lambda: self._bfla_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -487,6 +488,18 @@ class HackBotApp:
         ex_id = next((p for p in parts if p.isdigit()), None)
         text = self.agent._process_bola_action(
             {"exchange_id": ex_id, "plan_only": "--plan" in parts})
+        console.print(Markdown(text))
+        return True
+
+    def _bfla_command(self, args: str) -> bool:
+        """/bfla [--inventory] [--no-options] — function inventory + role × function matrix."""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        parts = args.split()
+        text = self.agent._process_bfla_action({
+            "inventory_only": "--inventory" in parts,
+            "discover_siblings": "--no-options" not in parts})
         console.print(Markdown(text))
         return True
 

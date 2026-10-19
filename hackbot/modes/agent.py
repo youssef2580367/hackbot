@@ -30,6 +30,7 @@ from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.core.authz_diff import AuthzDiff
+from hackbot.core.bfla import BflaTester, render_matrix
 from hackbot.core.bola import BolaTester
 from hackbot.core.corpus import Corpus
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
@@ -838,6 +839,8 @@ Explain your reasoning at each step."""
                     results_text.append(self._process_authz_diff_action(action))
                 elif atype == "bola_scan":
                     results_text.append(self._process_bola_action(action))
+                elif atype == "bfla_scan":
+                    results_text.append(self._process_bfla_action(action))
                 elif atype == "analyze_anomaly":
                     anomaly_result = self._process_anomaly_action(action)
                     results_text.append(anomaly_result)
@@ -1313,6 +1316,48 @@ Explain your reasoning at each step."""
         out["findings"] = [] if plan_only else [
             self._record_finding(act) for act in tester.finding_actions(report)]
         return out
+
+    def bfla_scan(self, max_functions: int = 20, discover_siblings: bool = True,
+                  inventory_only: bool = False) -> Dict[str, Any]:
+        """Function inventory + role × function matrix (BFLA).
+
+        Exposed cells are submitted as findings and go through every gate.
+        """
+        if self.identity_vault is None:
+            return {"refused": "load an identities file first (/identities load <file>)"}
+        tester = BflaTester(self.corpus, self.identity_vault, self.run_recorded)
+        functions = tester.inventory()
+        if discover_siblings and not inventory_only:
+            tester.discover_siblings([f for f in functions if f.privileged])
+        out: Dict[str, Any] = {"inventory": [f.to_dict() for f in functions],
+                               "matrix": [], "table": "", "findings": []}
+        if inventory_only:
+            return out
+        rows = tester.matrix(functions, max_functions=max_functions)
+        out["matrix"] = [r.to_dict() for r in rows]
+        out["table"] = render_matrix(rows, self.identity_vault.names())
+        out["findings"] = [self._record_finding(a) for a in tester.finding_actions(rows)]
+        return out
+
+    def _process_bfla_action(self, action: Dict[str, Any]) -> str:
+        try:
+            result = self.bfla_scan(
+                max_functions=min(int(action.get("max_functions", 20)), 40),
+                discover_siblings=bool(action.get("discover_siblings", True)),
+                inventory_only=bool(action.get("inventory_only", False)))
+        except (ValueError, TypeError) as exc:
+            return f"**[bfla_scan]** FAILED: {exc}"
+        if result.get("refused"):
+            return f"**[bfla_scan]** REFUSED: {result['refused']}"
+        priv = [f for f in result["inventory"] if f["privileged"]]
+        lines = [f"**[bfla_scan]** {len(result['inventory'])} functions, {len(priv)} privileged"]
+        for f in priv[:40]:
+            sib = f" · siblings via OPTIONS: {', '.join(f['siblings'])}" if f["siblings"] else ""
+            lines.append(f"- {f['method']} {f['template']} — {f['reason']}{sib}")
+        if result["table"]:
+            lines += ["", result["table"]]
+        lines.extend(result["findings"])
+        return "\n".join(lines)
 
     def _process_bola_action(self, action: Dict[str, Any]) -> str:
         try:

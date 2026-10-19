@@ -55,6 +55,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 ANONYMOUS = "anonymous"
+# Default privilege ranks; override per program with a top-level ``roles:``
+# mapping in the identities file (e.g. {user: 1, support: 2, admin: 3}).
+DEFAULT_ROLE_RANKS = {
+    "anonymous": 0, "guest": 0,
+    "user": 1, "customer": 1, "member": 1, "viewer": 1, "basic": 1,
+    "editor": 2, "manager": 2, "support": 2, "moderator": 2, "staff": 2,
+    "admin": 3, "administrator": 3, "owner": 3, "superuser": 3, "root": 3,
+}
 MIN_SECRET_LEN = 6
 _PLACEHOLDER_RE = re.compile(
     r"\{\{(cookie|bearer|header):([A-Za-z0-9_.-]+)(?::([A-Za-z0-9_-]+))?\}\}"
@@ -115,7 +123,7 @@ class Identity:
 
 class IdentityVault:
     def __init__(self, identities: Dict[str, Identity], max_identities: int = 4,
-                 source: str = ""):
+                 source: str = "", roles: Optional[Dict[str, int]] = None):
         if len(identities) > max_identities:
             raise IdentityError(
                 f"{len(identities)} identities exceed max_identities={max_identities} "
@@ -125,6 +133,8 @@ class IdentityVault:
         self.identities.setdefault(ANONYMOUS, Identity(name=ANONYMOUS, role="anonymous"))
         self.max_identities = max_identities
         self.source = source
+        self.role_ranks = dict(DEFAULT_ROLE_RANKS)
+        self.role_ranks.update({str(k).lower(): int(v) for k, v in (roles or {}).items()})
         self._secrets = sorted(
             (s for ident in self.identities.values() for s in ident.secrets()),
             key=lambda s: len(s[1]), reverse=True,
@@ -154,7 +164,10 @@ class IdentityVault:
                 markers=[str(m) for m in cfg.get("markers") or []],
                 owned={str(k): [str(i) for i in v] for k, v in (cfg.get("owned") or {}).items()},
             )
-        return cls(idents, int(data.get("max_identities", 4)), source)
+        roles = data.get("roles") or {}
+        if not isinstance(roles, dict):
+            raise IdentityError("'roles' must map role name → privilege rank")
+        return cls(idents, int(data.get("max_identities", 4)), source, roles)
 
     @classmethod
     def from_file(cls, path: str) -> "IdentityVault":
@@ -187,6 +200,16 @@ class IdentityVault:
                          f" auth={'+'.join(v['auth']) or 'none'}; markers={v['markers'] or '-'};"
                          f" owns={owned})")
         return "\n".join(lines)
+
+    def rank(self, name: str) -> int:
+        """Privilege rank of identity *name* (unknown roles rank as a normal user)."""
+        return self.role_ranks.get(self.get(name).role.lower(), 1)
+
+    def identity_for_marker(self, marker: str) -> Optional[str]:
+        for ident in self.identities.values():
+            if marker in ident.markers:
+                return ident.name
+        return None
 
     # ── ownership ledger ─────────────────────────────────────────────────
     def owner_of(self, object_id: str, obj_type: str = "") -> Optional[str]:

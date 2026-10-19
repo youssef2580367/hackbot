@@ -262,6 +262,7 @@ def show_help() -> None:
   [tool]/corpus[/] import|endpoints|ids|search  Request corpus (HAR, OpenAPI, proxy)
   [tool]/diff[/] <exchange #> [ids]  Replay a request as other identities (BOLA/BFLA)
   [tool]/bola[/] [exchange #] [--plan]  Ownership-aware object-ID substitution (IDOR)
+  [tool]/bfla[/] [--inventory] [--no-options]  Function inventory + role × function matrix
   [tool]/stop[/]              Stop current assessment
 
 [bold]Session:[/]
