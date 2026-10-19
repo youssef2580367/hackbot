@@ -194,6 +194,7 @@ class HackBotApp:
             "/scope": lambda: self._scope_command(args),
             "/identities": lambda: self._identities_command(args),
             "/corpus": lambda: self._corpus_command(args),
+            "/diff": lambda: self._diff_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -459,6 +460,21 @@ class HackBotApp:
                           markup=False, highlight=False)
         print_info(f"{len(corpus.exchanges)} exchanges, {len(eps)} endpoints. "
                    "Usage: /corpus import|endpoints|ids|search")
+        return True
+
+    def _diff_command(self, args: str) -> bool:
+        """/diff <exchange #> [identity ...] — differential authorization replay."""
+        parts = args.split()
+        if not self.agent or not parts or not parts[0].isdigit():
+            print_info("Usage: /diff <exchange #> [identity ...]   (see /corpus ids)")
+            return True
+        try:
+            text = self.agent._process_authz_diff_action(
+                {"exchange_id": int(parts[0]), "identities": parts[1:] or None})
+        except ValueError as exc:
+            print_error(str(exc))
+            return True
+        console.print(Markdown(text))
         return True
 
     def _identities_command(self, args: str) -> bool:

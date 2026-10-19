@@ -241,6 +241,8 @@ You are equipped with a ZeroDayEngine that provides:
 3. **Smart Fuzzing** — You can trigger intelligent fuzzing:
    ```json
    {"action": "fuzz", "target_url": "<url>", "parameter": "<param>", "categories": ["xss","command_injection","template_injection"], "explanation": "<why>"}
+   {"action": "authz_diff", "exchange_id": <corpus exchange #>, "identities": ["<optional subset of test identities>"], "explanation": "<why>"}
+   (replays one recorded request as every other test identity and reports exposure only when the owner's markers appear; needs /identities and /corpus data)
    ```
    Categories: buffer_overflow, integer_overflow, path_traversal, template_injection, ssrf, deserialization, command_injection, xss, header_injection, xxe, request_smuggling, race_condition
 

@@ -29,6 +29,7 @@ from hackbot.core.cve import CVELookup
 from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
+from hackbot.core.authz_diff import AuthzDiff
 from hackbot.core.corpus import Corpus
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
 from hackbot.core.identities import IdentityError, IdentityVault
@@ -832,6 +833,8 @@ Explain your reasoning at each step."""
                 elif atype == "fuzz":
                     fuzz_result = self._process_fuzz_action(action)
                     results_text.append(fuzz_result)
+                elif atype == "authz_diff":
+                    results_text.append(self._process_authz_diff_action(action))
                 elif atype == "analyze_anomaly":
                     anomaly_result = self._process_anomaly_action(action)
                     results_text.append(anomaly_result)
@@ -1258,6 +1261,55 @@ Explain your reasoning at each step."""
         return report
 
     # ── Zero-Day Action Handlers ─────────────────────────────────────
+
+    def run_recorded(self, command: str, explanation: str = "") -> tuple[int, str]:
+        """Run *command* through the gated runner and record it as an agent step."""
+        result = self.runner.execute(command, explanation=explanation)
+        step = AgentStep(
+            step_num=len(self.steps) + 1,
+            action="execute",
+            description=explanation,
+            tool_result=result,
+        )
+        self.steps.append(step)
+        if self.on_step:
+            self.on_step(step)
+        return step.step_num, f"{result.stdout}\n{result.stderr}"
+
+    def authz_diff(self, exchange_id: int, identities: Optional[List[str]] = None,
+                   record: bool = True) -> Dict[str, Any]:
+        """Differential authorization replay of a corpus exchange.
+
+        Exposed variants are submitted as findings, so they still have to pass
+        the proof gate, FP screen and pre-validation like any other claim.
+        """
+        if self.identity_vault is None:
+            return {"refused": "load an identities file first (/identities load <file>)"}
+        engine = AuthzDiff(self.corpus, self.identity_vault, self.run_recorded)
+        plan = engine.run(engine.plan(exchange_id, identities))
+        out: Dict[str, Any] = plan.to_dict()
+        out["findings"] = []
+        if record and not plan.refused:
+            for act in engine.finding_actions(plan):
+                out["findings"].append(self._record_finding(act))
+        return out
+
+    def _process_authz_diff_action(self, action: Dict[str, Any]) -> str:
+        try:
+            exchange_id = int(action.get("exchange_id", 0))
+            result = self.authz_diff(exchange_id, action.get("identities") or None)
+        except (ValueError, TypeError) as exc:
+            return f"**[authz_diff]** FAILED: {exc}"
+        if result.get("refused"):
+            return f"**[authz_diff]** REFUSED: {result['refused']}"
+        lines = [f"**[authz_diff]** #{exchange_id} {result['method']} {result['template']} "
+                 f"(owner {result['owner']}, baseline step {result['baseline']['step']})"]
+        if result["baseline"].get("detail"):
+            lines.append(f"- baseline: {result['baseline']['detail']}")
+        for v in result["variants"]:
+            lines.append(f"- as {v['identity']}: {v['verdict']} — {v['detail']} (step {v['step']})")
+        lines.extend(result["findings"])
+        return "\n".join(lines)
 
     def _process_fuzz_action(self, action: Dict[str, Any]) -> str:
         """Process a fuzz action from the AI agent."""
