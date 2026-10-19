@@ -195,6 +195,7 @@ class HackBotApp:
             "/identities": lambda: self._identities_command(args),
             "/corpus": lambda: self._corpus_command(args),
             "/diff": lambda: self._diff_command(args),
+            "/bola": lambda: self._bola_command(args),
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
@@ -474,6 +475,18 @@ class HackBotApp:
         except ValueError as exc:
             print_error(str(exc))
             return True
+        console.print(Markdown(text))
+        return True
+
+    def _bola_command(self, args: str) -> bool:
+        """/bola [exchange #] [--plan] — ownership-aware ID substitution."""
+        if not self.agent:
+            print_info("Start an agent first (/agent <target>)")
+            return True
+        parts = args.split()
+        ex_id = next((p for p in parts if p.isdigit()), None)
+        text = self.agent._process_bola_action(
+            {"exchange_id": ex_id, "plan_only": "--plan" in parts})
         console.print(Markdown(text))
         return True
 

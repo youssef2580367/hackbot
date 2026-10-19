@@ -30,6 +30,7 @@ from hackbot.core.engine import AIEngine, Conversation, create_conversation
 from hackbot.core.installer import ToolInstaller, InstallResult
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.core.authz_diff import AuthzDiff
+from hackbot.core.bola import BolaTester
 from hackbot.core.corpus import Corpus
 from hackbot.core.fp_filter import FalsePositiveClassifier, FPReview, ReviewDecision
 from hackbot.core.identities import IdentityError, IdentityVault
@@ -835,6 +836,8 @@ Explain your reasoning at each step."""
                     results_text.append(fuzz_result)
                 elif atype == "authz_diff":
                     results_text.append(self._process_authz_diff_action(action))
+                elif atype == "bola_scan":
+                    results_text.append(self._process_bola_action(action))
                 elif atype == "analyze_anomaly":
                     anomaly_result = self._process_anomaly_action(action)
                     results_text.append(anomaly_result)
@@ -1293,6 +1296,48 @@ Explain your reasoning at each step."""
             for act in engine.finding_actions(plan):
                 out["findings"].append(self._record_finding(act))
         return out
+
+    def bola_scan(self, exchange_id: Optional[int] = None, max_cases: int = 30,
+                  plan_only: bool = False) -> Dict[str, Any]:
+        """Ownership-aware ID substitution (BOLA/IDOR) over the corpus.
+
+        Exposed cases are submitted as findings and go through every gate.
+        """
+        if self.identity_vault is None:
+            return {"refused": "load an identities file first (/identities load <file>)"}
+        tester = BolaTester(self.corpus, self.identity_vault, self.run_recorded)
+        report = tester.plan(exchange_id, max_cases=max_cases)
+        if not plan_only:
+            tester.run(report)
+        out: Dict[str, Any] = report.to_dict()
+        out["findings"] = [] if plan_only else [
+            self._record_finding(act) for act in tester.finding_actions(report)]
+        return out
+
+    def _process_bola_action(self, action: Dict[str, Any]) -> str:
+        try:
+            ex_id = action.get("exchange_id")
+            result = self.bola_scan(int(ex_id) if ex_id else None,
+                                    max_cases=min(int(action.get("max_cases", 30)), 60),
+                                    plan_only=bool(action.get("plan_only", False)))
+        except (ValueError, TypeError) as exc:
+            return f"**[bola_scan]** FAILED: {exc}"
+        if result.get("refused"):
+            return f"**[bola_scan]** REFUSED: {result['refused']}"
+        lines = [f"**[bola_scan]** {len(result['cases'])} substitution case(s)"]
+        for c in result["cases"]:
+            base, atk = c.get("baseline") or {}, c.get("attack") or {}
+            state = atk.get("verdict") or (f"baseline {base.get('verdict')}" if base else "planned")
+            lines.append(
+                f"- #{c['exchange_id']} {c['method']} {c['location']}:{c['param']} "
+                f"{c['attacker']}→{c['victim']}'s {c['obj_type']} {c['victim_value']} "
+                f"[{c['mode']}] → {state} "
+                f"(step {atk.get('step') or base.get('step') or '-'}; "
+                f"{c['predictability']['kind']}, AC:{c['predictability']['attack_complexity']})")
+        if result["skipped"]:
+            lines.append(f"Skipped: {len(result['skipped'])} — e.g. {result['skipped'][0]}")
+        lines.extend(result["findings"])
+        return "\n".join(lines)
 
     def _process_authz_diff_action(self, action: Dict[str, Any]) -> str:
         try:

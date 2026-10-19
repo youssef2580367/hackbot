@@ -209,29 +209,35 @@ class AuthzDiff:
 
         for v in plan.variants:
             v.step, raw = self.execute(v.command, f"authz replay as {v.identity}")
-            if raw.startswith("BLOCKED") or "\nBLOCKED:" in raw:
-                v.verdict, v.detail = "blocked", raw.strip()[:300]
-                continue
-            resp = Response.parse(raw)
-            v.status = resp.status
-            v.similarity = round(similarity(base_resp.body, resp.body), 3)
-            # Markers of the requesting identity itself don't count (own data).
-            own = set(self.vault.get(v.identity).markers)
-            marker = next((m for m in markers if m not in own and m in resp.body), "")
-            if 200 <= resp.status < 300 and marker:
-                v.verdict, v.owner_marker = "exposed", marker
-                v.excerpt = _excerpt(resp.body, marker)
-                v.detail = f"{v.identity} received {plan.owner}'s marker {marker!r}"
-            elif resp.status in (401, 403, 404, 405) or (
-                    300 <= resp.status < 400) or _DENIED_RE.search(resp.body[:2000]):
-                v.verdict, v.detail = "denied", f"HTTP {resp.status}"
-            elif 200 <= resp.status < 300 and v.similarity >= 0.9:
-                v.verdict = "same_as_baseline"
-                v.detail = ("2xx and ≥90% similar to the owner's response, but no owner marker "
-                            "— a lead, not proof")
-            else:
-                v.verdict, v.detail = "different", f"HTTP {resp.status}, similarity {v.similarity}"
+            self.judge(v, raw, base_resp.body, plan.owner, markers)
         return plan
+
+    def judge(self, v: Variant, raw: str, base_body: str, owner: str,
+              markers: List[str]) -> Variant:
+        """Classify one replayed response against the owner's baseline body."""
+        if raw.startswith("BLOCKED") or "\nBLOCKED:" in raw:
+            v.verdict, v.detail = "blocked", raw.strip()[:300]
+            return v
+        resp = Response.parse(raw)
+        v.status = resp.status
+        v.similarity = round(similarity(base_body, resp.body), 3)
+        # Markers of the requesting identity itself don't count (own data).
+        own = set(self.vault.get(v.identity).markers)
+        marker = next((m for m in markers if m not in own and m in resp.body), "")
+        if 200 <= resp.status < 300 and marker:
+            v.verdict, v.owner_marker = "exposed", marker
+            v.excerpt = _excerpt(resp.body, marker)
+            v.detail = f"{v.identity} received {owner}'s marker {marker!r}"
+        elif resp.status in (401, 403, 404, 405) or (
+                300 <= resp.status < 400) or _DENIED_RE.search(resp.body[:2000]):
+            v.verdict, v.detail = "denied", f"HTTP {resp.status}"
+        elif 200 <= resp.status < 300 and v.similarity >= 0.9:
+            v.verdict = "same_as_baseline"
+            v.detail = ("2xx and ≥90% similar to the owner's response, but no owner marker "
+                        "— a lead, not proof")
+        else:
+            v.verdict, v.detail = "different", f"HTTP {resp.status}, similarity {v.similarity}"
+        return v
 
     # ── finding drafts (facts only) ──────────────────────────────────────
     def finding_actions(self, plan: DiffPlan) -> List[Dict[str, Any]]:
