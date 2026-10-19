@@ -207,6 +207,15 @@ textarea#agentInput{min-height:56px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--border2)}
+.approval-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:9999}
+.approval-overlay.show{display:flex}
+.approval-box{background:var(--bg2);border:1px solid var(--orange);border-radius:var(--radius);padding:20px;width:min(720px,92vw);max-height:85vh;overflow:auto}
+.approval-box pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin:8px 0;font-family:var(--mono);font-size:.82rem;user-select:text}
+.approval-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
+.verif-badge{padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700;margin-left:6px}
+.verif-confirmed{background:var(--green-dim);color:#fff}.verif-lead{background:var(--yellow);color:#000}.verif-dismissed{background:var(--red);color:#fff}
+.finding-meta{font-size:.8rem;color:var(--text-dim);margin:6px 0}
+.finding-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 </style>
 </head>
 <body>
@@ -1658,20 +1667,41 @@ async function loadFindings() {
       container.innerHTML = '<p style="color:var(--text-dim)">No findings yet. Run an agent assessment first.</p>';
       return;
     }
-    let html = `<p style="margin-bottom:16px"><strong>${data.findings.length}</strong> findings | Target: <strong>${data.target}</strong></p>`;
-    for (const f of data.findings) {
+    let html = `<p style="margin-bottom:16px"><strong>${data.findings.length}</strong> findings | Target: <strong>${escapeHtml(data.target)}</strong></p>`;
+    data.findings.forEach((f, i) => {
+      // Finding text comes from the AI and from target responses: escape all of it.
+      const sev = ['Critical','High','Medium','Low','Info'].includes(f.severity) ? f.severity : 'Info';
+      const status = f.dismissed ? ['dismissed', 'DISMISSED'] :
+        (f.verification === 'confirmed' ? ['confirmed', 'CONFIRMED'] : ['lead', 'UNVERIFIED LEAD']);
+      const fp = f.fp_triage || {};
+      const review = (fp.review || {}).decision;
+      const v = f.validation || {};
+      const missing = ((f.proof || {}).missing || []).map(m => `<li>${escapeHtml(m)}</li>`).join('');
+      const signals = (fp.signals || []).map(x => `<li>${escapeHtml(x.code)}: ${escapeHtml(x.explanation)}</li>`).join('');
       html += `
         <div class="finding-card">
           <div class="finding-header">
-            <span class="severity-badge severity-${f.severity}">${f.severity}</span>
-            <strong>${f.title}</strong>
+            <span class="severity-badge severity-${sev}">${sev}</span>
+            <strong>${escapeHtml(f.raw_title || f.title)}</strong>
+            <span class="verif-badge verif-${status[0]}">${status[1]}</span>
           </div>
-          <p>${f.description}</p>
+          <div class="finding-meta">Pre-validation: ${escapeHtml(v.label || 'not run')} — ${escapeHtml(v.reason || '')}
+            · FP screen: ${escapeHtml(fp.label || 'unscreened')}${review ? ' · reviewed: ' + escapeHtml(review) : ''}</div>
+          <p>${escapeHtml(f.description)}</p>
           ${f.evidence ? `<pre><code>${escapeHtml(f.evidence)}</code></pre>` : ''}
-          ${f.recommendation ? `<div style="border-left:3px solid var(--cyan);padding-left:10px;margin-top:8px;color:var(--cyan2)"><strong>Recommendation:</strong> ${f.recommendation}</div>` : ''}
+          ${missing ? `<div class="finding-meta"><strong>Missing proof</strong><ul>${missing}</ul></div>` : ''}
+          ${signals ? `<div class="finding-meta" style="color:var(--orange)"><strong>False-positive signals</strong><ul>${signals}</ul></div>` : ''}
+          ${f.recommendation ? `<div style="border-left:3px solid var(--cyan);padding-left:10px;margin-top:8px;color:var(--cyan2)"><strong>Recommendation:</strong> ${escapeHtml(f.recommendation)}</div>` : ''}
+          <div class="finding-actions">
+            <button class="btn btn-sm" onclick="findingAction(${i}, 'valid')">✓ Valid</button>
+            <button class="btn btn-sm" onclick="findingAction(${i}, 'false_positive')">✗ False positive</button>
+            <button class="btn btn-sm" onclick="findingAction(${i}, 'needs_more_evidence')">… Needs evidence</button>
+            <button class="btn btn-sm" onclick="findingAction(${i}, 'attest')">📎 Attest recording</button>
+            <button class="btn btn-sm" onclick="findingAction(${i}, 'replay')">↻ Controlled replay</button>
+          </div>
         </div>
       `;
-    }
+    });
     container.innerHTML = html;
   } catch (e) {
     container.innerHTML = `<p style="color:var(--red)">Failed to load findings: ${e.message}</p>`;
@@ -3536,6 +3566,66 @@ document.addEventListener('keydown', (e) => {
     if (input) input.focus();
   }
 });
+
+// ── Human approvals (scope / escalation gates) ─────────────────────────────
+let _approvalCurrent = null;
+async function pollApprovals() {
+  try {
+    const resp = await fetch('/api/approvals');
+    const data = await resp.json();
+    const next = (data.pending || [])[0] || null;
+    const overlay = document.getElementById('approvalOverlay');
+    if (!next) { _approvalCurrent = null; overlay.classList.remove('show'); return; }
+    if (_approvalCurrent && _approvalCurrent.id === next.id) return;
+    _approvalCurrent = next;
+    document.getElementById('approvalReason').textContent = next.reason;
+    document.getElementById('approvalCommand').textContent = next.command;
+    overlay.classList.add('show');
+  } catch (e) { /* server not ready */ }
+}
+async function decideApproval(approve) {
+  if (!_approvalCurrent) return;
+  const id = _approvalCurrent.id;
+  const resp = await fetch(`/api/approvals/${id}`, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({approve})});
+  toast(resp.ok ? (approve ? 'Approved once' : 'Denied') : 'Approval already expired',
+        resp.ok ? '' : 'error');
+  _approvalCurrent = null;
+  document.getElementById('approvalOverlay').classList.remove('show');
+  pollApprovals();
+}
+setInterval(pollApprovals, 2000);
+
+// ── Finding review actions ─────────────────────────────────────────────────
+async function findingAction(index, action) {
+  let body = {};
+  if (action === 'attest') {
+    const path = prompt('Path to recorded evidence on this machine (Burp/HAR/screenshot):');
+    if (!path) return;
+    body = {path, note: prompt('Note (optional):') || ''};
+  } else if (action !== 'replay') {
+    body = {decision: action, note: prompt('Review note (optional):') || ''};
+    action = 'review';
+  }
+  const resp = await fetch(`/api/agent/findings/${index}/${action}`, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) { toast(data.error || 'Action failed', 'error'); return; }
+  toast(`Finding #${index + 1}: ${action} done`);
+  loadFindings();
+}
 </script>
+<div class="approval-overlay" id="approvalOverlay" role="dialog" aria-modal="true" aria-labelledby="approvalTitle">
+  <div class="approval-box">
+    <h3 id="approvalTitle" style="color:var(--orange)">⚠️ Human approval required</h3>
+    <div class="finding-meta">The agent is paused. auto_confirm cannot answer this; no answer within the timeout = deny.</div>
+    <strong>Why</strong><pre id="approvalReason"></pre>
+    <strong>Command</strong><pre id="approvalCommand"></pre>
+    <div class="approval-actions">
+      <button class="btn btn-sm" style="background:var(--red);color:#fff" onclick="decideApproval(false)">Deny</button>
+      <button class="btn btn-sm" style="background:var(--green-dim);color:#fff" onclick="decideApproval(true)">Approve once</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>

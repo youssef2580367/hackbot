@@ -35,6 +35,7 @@ from hackbot.core.remediation import RemediationEngine
 from hackbot.core.proxy import ProxyEngine, get_proxy_engine
 from hackbot.core.updater import check_for_updates, perform_update
 from hackbot.core.vulndb import VulnDB
+from hackbot.gui.approvals import ApprovalQueue
 from hackbot.memory import MemoryManager
 from hackbot.modes.agent import AgentMode
 from hackbot.modes.chat import ChatMode
@@ -65,6 +66,8 @@ _state: Dict[str, Any] = {
     "agent": None,
     "plan": None,
     "mode": "chat",
+    # Human approvals for the scope / escalation gates (never auto_confirm).
+    "approvals": ApprovalQueue(),
 }
 
 
@@ -428,6 +431,7 @@ def api_agent_start():
         engine=engine,
         config=config,
         on_confirm=lambda cmd, reason: config.agent.auto_confirm,
+        on_approve=_state["approvals"].request,
     )
     _state["agent"] = agent
     _state["mode"] = "agent"
@@ -547,6 +551,7 @@ def api_agent_run_command():
             engine=_state["engine"],
             config=config,
             on_confirm=lambda cmd, reason: config.agent.auto_confirm,
+            on_approve=_state["approvals"].request,
         )
         _state["agent"] = agent
 
@@ -644,6 +649,51 @@ def api_agent_review(index: int):
         return jsonify({"error": "decision must be valid, false_positive or "
                                  "needs_more_evidence"}), 400
     return jsonify({"ok": True, "finding": finding.to_dict()})
+
+
+@app.route("/api/approvals")
+def api_approvals():
+    """Pending human approvals (scope-unverified / escalation commands)."""
+    q: ApprovalQueue = _state["approvals"]
+    return jsonify({"pending": q.pending(), "history": q.history()[-20:]})
+
+
+@app.route("/api/approvals/<int:item_id>", methods=["POST"])
+def api_approval_decide(item_id: int):
+    data = request.json or {}
+    if not isinstance(data.get("approve"), bool):
+        return jsonify({"error": "approve must be true or false"}), 400
+    if not _state["approvals"].decide(item_id, data["approve"]):
+        return jsonify({"error": "No such pending approval"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/agent/findings/<int:index>/attest", methods=["POST"])
+def api_agent_attest(index: int):
+    """Attach a recorded artifact (path on this machine) to finding *index*."""
+    agent: Optional[AgentMode] = _state["agent"]
+    if not agent or not 0 <= index < len(agent.findings):
+        return jsonify({"error": "No such finding"}), 404
+    data = request.json or {}
+    path = str(data.get("path", "")).strip()
+    if not path:
+        return jsonify({"error": "path is required"}), 400
+    try:
+        finding = agent.attest_evidence(index, path, str(data.get("note", "")))
+    except OSError as exc:
+        return jsonify({"error": f"cannot read {path}: {exc}"}), 400
+    return jsonify({"ok": True, "finding": finding.to_dict()})
+
+
+@app.route("/api/agent/findings/<int:index>/replay", methods=["POST"])
+def api_agent_finding_replay(index: int):
+    """Controlled replay of finding *index* (gated; may wait for approval)."""
+    agent: Optional[AgentMode] = _state["agent"]
+    if not agent or not 0 <= index < len(agent.findings):
+        return jsonify({"error": "No such finding"}), 404
+    result = agent.reproduce_finding(index)
+    return jsonify({"ok": True, "result": result,
+                    "finding": agent.findings[index].to_dict()})
 
 
 @app.route("/api/agent/scripts")
@@ -1783,6 +1833,7 @@ def api_campaign_start_target():
     agent = AgentMode(
         engine=engine, config=config,
         on_confirm=lambda cmd, reason: config.agent.auto_confirm,
+        on_approve=_state["approvals"].request,
         on_token=lambda t: token_queue.put(t),
     )
     _state["agent"] = agent
