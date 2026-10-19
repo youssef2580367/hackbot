@@ -397,3 +397,63 @@ def test_scope_config_round_trip(tmp_path, monkeypatch):
     assert loaded.scope.file == "/tmp/scope.yaml"
     assert loaded.scope.sample_limit == 3
     assert loaded.scope.enforce is True
+
+
+# ── scheme / host / port awareness ───────────────────────────────────────────
+
+
+class TestPortAwareScope:
+    @pytest.fixture
+    def lab(self):
+        return ScopePolicy(
+            in_scope=["http://127.0.0.1:3000", "localhost:8888"],
+            out_of_scope=["http://127.0.0.1:3000/api/Challenges", "localhost:8025"],
+        )
+
+    @pytest.mark.parametrize("target,ok", [
+        ("http://127.0.0.1:3000/rest/products", True),
+        ("http://127.0.0.1:3001/", False),           # other port on same host
+        ("http://127.0.0.1/", False),                # default port 80
+        ("https://127.0.0.1:3000/", False),          # rule pins http
+        ("http://127.0.0.1:3000/api/Challenges", False),
+        ("http://127.0.0.1:3000/api/Challenges/1", False),
+        ("http://127.0.0.1:3000/api/ChallengesX", True),  # prefix is path-segment aware
+        ("http://127.0.0.1:3000/API/challenges", False),  # case variants stay excluded
+        ("http://localhost:8888/identity/api", True),
+        ("https://localhost:8888/", True),           # host:port rule: any scheme
+        ("http://localhost:8025/api/v2/messages", False),
+        ("localhost:8025", False),
+        ("http://LOCALHOST.:8888/", True),           # case + trailing dot normalised
+    ])
+    def test_targets(self, lab, target, ok):
+        assert lab.check_raw_target(target)[0] is ok, lab.check_raw_target(target)
+
+    @pytest.mark.parametrize("target", [
+        "http://2130706433:3000/", "http://0x7f.1:3000/", "http://127.1:3000/",
+        "http://[::ffff:127.0.0.1]:3000/",
+    ])
+    def test_alternate_ip_encodings_fail_closed(self, lab, target):
+        assert not lab.check_raw_target(target)[0]
+
+    def test_userinfo_does_not_confuse_host(self, lab):
+        assert not lab.check_raw_target("http://127.0.0.1:3000@evil.org/")[0]
+
+    def test_bare_host_cannot_satisfy_port_rule(self, lab):
+        assert lab.check_command("nmap -sV 127.0.0.1").verdict == ScopeVerdict.DENY
+        assert lab.check_command("curl -s http://127.0.0.1:3000/").verdict == ScopeVerdict.ALLOW
+
+    def test_portless_rules_keep_old_behaviour(self):
+        p = ScopePolicy(in_scope=["localhost"])
+        assert p.check_raw_target("http://localhost:8025/")[0]
+        assert p.check_raw_target("http://localhost:3000/")[0]
+
+    def test_idna_hostnames(self):
+        p = ScopePolicy(in_scope=["bücher.example"])
+        assert p.check_raw_target("https://xn--bcher-kva.example/")[0]
+        assert p.check_raw_target("https://BÜCHER.example/")[0]
+
+    def test_invalid_port_rule(self):
+        with pytest.raises(ValueError):
+            ScopeRule.parse("localhost:99999")
+        with pytest.raises(ValueError):
+            ScopeRule.parse("http://localhost:0x50/")

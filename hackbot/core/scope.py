@@ -138,6 +138,8 @@ class ScopeRule:
     host: str = ""
     path_prefix: str = ""
     network: Optional[Any] = None  # ipaddress network for ip/cidr
+    port: Optional[int] = None     # None = any port
+    scheme: str = ""               # "" = any scheme
 
     @classmethod
     def parse(cls, entry: str) -> "ScopeRule":
@@ -148,16 +150,24 @@ class ScopeRule:
 
         if "://" in value:
             parts = urlsplit(value)
-            host = (parts.hostname or "").strip(".")
+            host = _norm_host(parts.hostname or "")
             if not host:
                 raise ValueError(f"invalid URL scope rule: {raw}")
+            try:
+                port = parts.port
+            except ValueError as exc:
+                raise ValueError(f"invalid port in scope rule: {raw}") from exc
+            scheme = parts.scheme
             path = parts.path.rstrip("/")
             if host.startswith("*."):
-                return cls(raw=raw, kind="wildcard", host=host[2:], path_prefix=path)
+                return cls(raw=raw, kind="wildcard", host=host[2:], path_prefix=path,
+                           port=port, scheme=scheme)
             ip_net = _as_network(host)
             if ip_net is not None:
-                return cls(raw=raw, kind="ip", host=host, path_prefix=path, network=ip_net)
-            return cls(raw=raw, kind="url" if path else "host", host=host, path_prefix=path)
+                return cls(raw=raw, kind="ip", host=host, path_prefix=path, network=ip_net,
+                           port=port, scheme=scheme)
+            return cls(raw=raw, kind="url" if path else "host", host=host, path_prefix=path,
+                       port=port, scheme=scheme)
 
         if "/" in value:
             try:
@@ -170,21 +180,31 @@ class ScopeRule:
         if ip_net is not None:
             return cls(raw=raw, kind="ip", host=value, network=ip_net)
 
+        # host:port / [v6]:port without a scheme
+        m = _HOST_PORT_RE.match(value)
+        if m:
+            inner = cls.parse(m.group("host").strip("[]"))
+            return cls(raw=raw, kind=inner.kind, host=inner.host, network=inner.network,
+                       port=_valid_port(m.group("port"), raw))
+
         if value.startswith("*."):
             base = value[2:].strip(".")
             if not _HOSTNAME_RE.match(base):
                 raise ValueError(f"invalid wildcard scope rule: {raw}")
             return cls(raw=raw, kind="wildcard", host=base)
 
-        host = value.strip(".")
-        if ":" in host and not host.startswith("["):
-            host = host.split(":", 1)[0]
+        host = _norm_host(value)
         if not _HOSTNAME_RE.match(host) and host != "localhost":
             raise ValueError(f"invalid host scope rule: {raw}")
         return cls(raw=raw, kind="host", host=host)
 
-    def matches(self, host: str, path: str = "") -> bool:
-        host = host.lower().strip(".")
+    def matches(self, host: str, path: str = "", port: Optional[int] = None,
+                scheme: str = "") -> bool:
+        host = _norm_host(host)
+        if self.port is not None and port != self.port:
+            return False  # unknown target port never satisfies a port-bound rule
+        if self.scheme and scheme and scheme != self.scheme:
+            return False
         if self.kind in ("ip", "cidr"):
             ip = _as_ip(host)
             if ip is None or self.network is None:
@@ -199,11 +219,34 @@ class ScopeRule:
                 return False
 
         if self.path_prefix:
+            # Case-insensitive: many frameworks (Express, IIS) route /API/x like /api/x,
+            # so an exclusion must not be bypassable by changing case.
             norm = "/" + path.lstrip("/") if path else "/"
-            norm = norm.split("?", 1)[0].split("#", 1)[0]
+            norm = norm.split("?", 1)[0].split("#", 1)[0].lower()
             if not (norm == self.path_prefix or norm.startswith(self.path_prefix + "/")):
                 return False
         return True
+
+
+def _norm_host(host: str) -> str:
+    """Lowercase, strip trailing dots and IPv6 brackets, IDNA-encode unicode names."""
+    host = (host or "").strip().strip("[]").rstrip(".").lower()
+    if host and not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return host
+    return host
+
+
+def _valid_port(value: str, raw: str) -> int:
+    port = int(value)
+    if not 0 < port < 65536:
+        raise ValueError(f"invalid port in scope rule: {raw}")
+    return port
+
+
+DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
 
 
 def _as_ip(value: str) -> Optional[Any]:
@@ -231,6 +274,8 @@ class Target:
     host: str
     path: str = ""
     is_cidr: bool = False
+    port: Optional[int] = None
+    scheme: str = ""
 
 
 def _target_from_token(token: str) -> Optional[Target]:
@@ -242,12 +287,16 @@ def _target_from_token(token: str) -> Optional[Target]:
     if "://" in low:
         try:
             parts = urlsplit(tok)
-            host = (parts.hostname or "").lower()
+            host = _norm_host(parts.hostname or "")
+            port = parts.port
         except ValueError:
             return None
         if not host:
             return None
-        return Target(raw=tok, host=host, path=parts.path or "/")
+        scheme = parts.scheme.lower()
+        return Target(raw=tok, host=host, path=parts.path or "/",
+                      port=port if port is not None else DEFAULT_PORTS.get(scheme),
+                      scheme=scheme)
 
     if "/" in low:
         try:
@@ -263,9 +312,10 @@ def _target_from_token(token: str) -> Optional[Target]:
 
     m = _HOST_PORT_RE.match(low)
     if m:
-        host = m.group("host").strip("[]")
+        host = _norm_host(m.group("host"))
         if _as_ip(host) is not None or (_HOSTNAME_RE.match(host) or host == "localhost"):
-            return Target(raw=tok, host=host)
+            port = int(m.group("port"))
+            return Target(raw=tok, host=host, port=port if 0 < port < 65536 else None)
         return None
 
     if _as_ip(low) is not None:
@@ -558,7 +608,8 @@ class ScopePolicy:
         return f"In scope: {ins}\nOut of scope: {outs}"
 
     # ── decisions ────────────────────────────────────────────────────────
-    def check_target(self, host: str, path: str = "", is_cidr: bool = False) -> Tuple[bool, str]:
+    def check_target(self, host: str, path: str = "", is_cidr: bool = False,
+                     port: Optional[int] = None, scheme: str = "") -> Tuple[bool, str]:
         host = host.lower()
         if is_cidr:
             try:
@@ -573,21 +624,22 @@ class ScopePolicy:
                     return True, f"{host} within {rule.raw}"
             return False, f"{host} is not fully inside any in-scope network"
 
+        where = f"{host}{':' + str(port) if port else ''}"
         for rule in self.out_of_scope:
-            # an out-of-scope rule with a path only excludes that path
-            if rule.matches(host, path):
-                return False, f"{host}{path} matches out-of-scope rule {rule.raw}"
+            # out-of-scope rules with a path / port only exclude that path / port
+            if rule.matches(host, path, port, scheme):
+                return False, f"{where}{path} matches out-of-scope rule {rule.raw}"
         for rule in self.in_scope:
-            if rule.matches(host, path):
-                return True, f"{host} matches {rule.raw}"
-        return False, f"{host}{path if path not in ('', '/') else ''} is not in scope"
+            if rule.matches(host, path, port, scheme):
+                return True, f"{where} matches {rule.raw}"
+        return False, f"{where}{path if path not in ('', '/') else ''} is not in scope"
 
     def check_raw_target(self, target: str) -> Tuple[bool, str]:
         """Check a user-supplied target string (URL, host, IP or CIDR)."""
         t = _target_from_token(target.strip())
         if t is None:
             return False, f"cannot parse target {target!r}"
-        return self.check_target(t.host, t.path, t.is_cidr)
+        return self.check_target(t.host, t.path, t.is_cidr, t.port, t.scheme)
 
     def check_command(self, command: str) -> ScopeDecision:
         ext = extract_targets(command)
@@ -608,7 +660,7 @@ class ScopePolicy:
         bad: List[str] = []
         reasons: List[str] = []
         for t in ext.targets:
-            ok, why = self.check_target(t.host, t.path, t.is_cidr)
+            ok, why = self.check_target(t.host, t.path, t.is_cidr, t.port, t.scheme)
             if not ok:
                 bad.append(t.raw)
                 reasons.append(why)
