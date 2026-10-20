@@ -193,9 +193,36 @@ def _status_only(ctx: Context) -> Optional[FPSignal]:
     return None
 
 
+_ERROR_CLAIM_RE = re.compile(r"traceback|stack ?trace|verbose error|error (message|page|"
+                             r"disclosure)|debug (info|output)|exception (details|message)",
+                             re.I)
+_TRACE_RE = re.compile(r"traceback \(most recent call last\)|\bat [\w.$]+\(|"
+                       r"\bfile \"[^\"]+\", line \d+|exception in thread|stack trace", re.I)
+_SECRET_RE = re.compile(r"passw(or)?d\s*[=:]|secret\s*[=:]|api[_-]?key\s*[=:]|token\s*[=:]|"
+                        r"-----begin [a-z ]*private key|(postgres|mysql|mongodb)(\+\w+)?://\S+:\S+@|"
+                        r"aws_secret|akia[0-9a-z]{16}", re.I)
+
+
+_OTHER_CLASS_RE = re.compile(r"injection|sqli|traversal|ssrf|idor|bola|bfla|bypass|"
+                             r"\brce\b|command|xss|xxe|deserializ|takeover|escalation", re.I)
+
+
+def _verbose_error_only(ctx: Context) -> Optional[FPSignal]:
+    """D16: a finding whose whole case is an error message / stack trace."""
+    if not _ERROR_CLAIM_RE.search(ctx.text) or _OTHER_CLASS_RE.search(ctx.text):
+        return None
+    evidence = f"{ctx.excerpts}\n{ctx.outputs}"
+    if not _TRACE_RE.search(evidence) or _SECRET_RE.search(evidence):
+        return None
+    return FPSignal("VERBOSE_ERROR_ONLY", "high",
+                    "the evidence is an error message / stack trace without secrets or a "
+                    "security effect — expected behaviour or informational unless it is "
+                    "chained into a real impact")
+
+
 RULES: List[Callable[[Context], Optional[FPSignal]]] = [
     _waf, _soft_404, _login_redirect, _spa_shell, _default_page, _encoded_xss,
-    _publishable_key, _scanner_only, _self_target, _status_only,
+    _publishable_key, _scanner_only, _self_target, _status_only, _verbose_error_only,
 ]
 
 

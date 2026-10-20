@@ -456,3 +456,82 @@ def test_d14_cross_tenant_manual_finding_gets_tenants(agent):
     assert f.boundary_type == "tenant_isolation"
     assert (f.attacker_tenant, f.victim_tenant) == ("acme", "globex")
     assert f.title == "Invoice IDOR"  # hunter's text untouched
+
+
+# D15 / D16 (blind fixture runs 2–4) ─────────────────────────────────────────
+@pytest.mark.parametrize("raw,base,url", [
+    ("GET /api/v1/shipments/search", "http://127.0.0.1:4000", "http://127.0.0.1:4000/api/v1/shipments/search"),
+    ("/api/v1/invoices/2", "http://127.0.0.1:4000/", "http://127.0.0.1:4000/api/v1/invoices/2"),
+    ("PATCH /api/v1/me (role field)", "http://127.0.0.1:4000", "http://127.0.0.1:4000/api/v1/me"),
+    ("GET /api/v1/me", "", "GET /api/v1/me"),
+])
+def test_d15_relative_asset_resolved_against_target(raw, base, url):
+    assert normalize_asset(raw, base) == url
+
+
+def test_d15_relative_asset_passes_q3(agent):
+    agent.target = "http://127.0.0.1:3000"
+    agent._record_finding(_act(asset="GET /api/Users/26"))
+    q3 = next(q for q in agent.findings[0].validation["questions"] if q["q"] == "Q3")
+    assert q3["status"] == "pass", q3
+
+
+def test_d15_validator_skips_unresolvable_relative_asset(validator):
+    f = _confirmed("Cross-tenant invoice IDOR", "bola", '"owner_email":"hunter2@lab.test"',
+                   asset="GET /api/v1/invoices/4", victim_identity="hunter2",
+                   victim_markers=["hunter2@lab.test"])
+    f["proof"]["verified_refs"][0]["command"] = "curl -s http://127.0.0.1:4000/api/v1/invoices/4"
+    q3 = next(q for q in validator.validate(f, scope_policy=ScopePolicy(
+        in_scope=["http://127.0.0.1:4000"])).questions if q.q == "Q3")
+    assert q3.status == "pass", q3
+
+
+TRACE = ('HTTP/1.1 500 INTERNAL SERVER ERROR\r\n\r\nTraceback (most recent call last):\n'
+         '  File "/app/app.py", line 412, in render_report\nKeyError: "unknown report template"')
+
+
+def _fp(title, vclass, output):
+    from hackbot.core.fp_filter import FalsePositiveClassifier
+
+    finding = {"raw_title": title, "vuln_class": vclass,
+               "proof": {"verified_refs": [{"excerpt": "Traceback (most recent call last)",
+                                            "step": 1}]}}
+    return FalsePositiveClassifier().classify(finding, {1: {"command": "curl -s -i x",
+                                                            "output": output}})
+
+
+def test_d16_verbose_traceback_alone_is_flagged():
+    r = _fp("Verbose Python traceback disclosed by report rendering",
+            "information disclosure", TRACE)
+    assert "VERBOSE_ERROR_ONLY" in [s["code"] for s in r["signals"]]
+    assert r["label"] == "likely_false_positive"
+
+
+def test_d16_traceback_with_secret_is_not_flagged():
+    r = _fp("Stack trace discloses database credentials", "information disclosure",
+            TRACE + "\nDATABASE_URL=postgres://app:hunter2pass@db:5432/app")
+    assert "VERBOSE_ERROR_ONLY" not in [s["code"] for s in r["signals"]]
+
+
+def test_d16_other_classes_citing_an_error_are_not_flagged():
+    r = _fp("SQL injection in search (error message reveals the query)", "sql injection", TRACE)
+    assert "VERBOSE_ERROR_ONLY" not in [s["code"] for s in r["signals"]]
+
+
+def test_d16_flag_blocks_ready_verdict_until_reviewed(agent):
+    from hackbot.modes.agent import AgentStep
+
+    res = ToolResult(tool="curl", command="curl -s -i http://127.0.0.1:3000/api/v1/reports/render",
+                     stdout=TRACE, stderr="", return_code=0, duration=0.1, success=True)
+    agent.steps.append(AgentStep(step_num=20, action="execute", description="", tool_result=res))
+    agent._record_finding(_act(
+        title="Verbose Python traceback disclosed by report rendering",
+        vuln_class="information disclosure", victim_identity="", severity="Low",
+        behavior="an unknown template name returns a Python traceback",
+        boundary="error handling should not expose internals",
+        impact="the server returned a Python traceback with an internal file path",
+        asset="http://127.0.0.1:3000/api/v1/reports/render",
+        evidence_refs=[{"step": 20, "excerpt": "Traceback (most recent call last)"}]))
+    f = agent.findings[0]
+    assert f.confirmed  # the observation itself is real
+    assert f.validation["verdict"] == "review_required"

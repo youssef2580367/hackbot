@@ -86,10 +86,26 @@ def parse_severity(value: Any) -> Severity:
 _URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>]+", re.I)
 
 
-def normalize_asset(asset: str) -> str:
-    """The URL inside an asset string ('GET http://h/p?q=' → 'http://h/p?q=')."""
+_METHOD_PREFIX = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+", re.I)
+
+
+def normalize_asset(asset: str, base: str = "") -> str:
+    """The URL an asset string points at.
+
+    'GET http://h/p?q=' → 'http://h/p?q='; with *base* (the engagement target),
+    a relative 'GET /api/v1/x' → 'http://h:port/api/v1/x' (D15).
+    """
     m = _URL_IN_TEXT.search(asset or "")
-    return m.group(0).rstrip(".,;)") if m else (asset or "").strip()
+    if m:
+        return m.group(0).rstrip(".,;)")
+    path = _METHOD_PREFIX.sub("", (asset or "").strip()).split()[0] if (asset or "").strip() else ""
+    if path.startswith("/") and base:
+        from urllib.parse import urljoin, urlsplit
+
+        origin = urlsplit(base if "://" in base else "")
+        if origin.scheme and origin.netloc:
+            return urljoin(f"{origin.scheme}://{origin.netloc}", path)
+    return (asset or "").strip()
 
 
 @dataclass
@@ -1879,7 +1895,7 @@ Explain your reasoning at each step."""
         """Record a finding; the proof gate decides CONFIRMED vs LEAD."""
         severity = parse_severity(action.get("severity", "Info"))
         if action.get("asset"):
-            action = dict(action, asset=normalize_asset(str(action["asset"])))
+            action = dict(action, asset=normalize_asset(str(action["asset"]), self.target))
         if not action.get("boundary_type"):
             # D14: manual findings get a boundary type too (engine findings already do)
             inferred = infer_boundary_type(action, self.identity_vault)

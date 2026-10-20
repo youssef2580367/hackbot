@@ -429,6 +429,10 @@ class FindingValidator:
         url_in_asset = re.search(r"https?://[^\s'\"<>]+", asset)
         if url_in_asset:
             asset = url_in_asset.group(0).rstrip(".,;)")
+        elif asset:
+            # D15: a relative path cannot be scope-checked on its own; the cited
+            # requests (checked below) carry the real target.
+            asset = ""
         commands = [r["command"] for r in refs if r.get("command")]
         if scope_policy is None:
             q.append(QuestionResult("Q3", "human", "no enforced scope policy"))
