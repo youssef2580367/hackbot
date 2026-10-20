@@ -121,6 +121,12 @@ _GOTCHAS_ALIASES = {
     "path traversal": "path traversal / lfi", "lfi": "path traversal / lfi",
 }
 
+_VERTICAL_WORDS = ("privilege escalation", "privesc", "mass assignment", "mass_assignment",
+                   "bopla", "role", "vertical")
+_ELEVATED_RE = re.compile(r"\"(role|roles|isAdmin|is_admin|is_staff|admin|permissions?|scope|"
+                          r"groups?)\"\s*:\s*\"?(admin|administrator|root|superuser|staff|true|"
+                          r"owner|manager|write|\*)", re.I)
+
 _SQL_ERROR_RE = re.compile(
     r"sql syntax|mysql_fetch|ora-\d{5}|pg::|sqlstate|sqlite3?\.|unclosed quotation|"
     r"odbc|syntax error at or near|warning: mysql", re.I)
@@ -475,9 +481,18 @@ class FindingValidator:
                     "Q6", "fail",
                     "tenant isolation claimed but attacker and victim are not in two "
                     "distinct tenants in the identity vault")
-        if any(c in low for c in AUTH_CLASSES):
-            a = str(finding.get("attacker_identity", "")).strip()
-            b = str(finding.get("victim_identity", "")).strip()
+        a = str(finding.get("attacker_identity", "")).strip()
+        b = str(finding.get("victim_identity", "")).strip()
+        vertical = not b and any(w in low for w in _VERTICAL_WORDS)
+        if vertical:
+            # Escalating the attacker's OWN account (e.g. role set at sign-up): there is
+            # no victim; the evidence must show the elevated privilege itself.
+            if not _ELEVATED_RE.search(excerpts):
+                return QuestionResult(
+                    "Q6", "fail",
+                    "vertical privilege escalation: evidence must show the elevated "
+                    "role/permission")
+        elif any(c in low for c in AUTH_CLASSES):
             vid = str(finding.get("victim_identifier", "")).strip()
             if not a or not b or a == b:
                 return QuestionResult(

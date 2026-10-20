@@ -180,9 +180,15 @@ class HuntSession:
         # identity="" lets the corpus attribute manually supplied credentials itself
         self.agent.corpus.add("hunter", method, url, req_headers, body, resp.status,
                               _parse_headers(resp.headers), resp.body, identity=identity)
+        learned: List[str] = []
+        if identity and identity != ANONYMOUS and 200 <= resp.status < 300:
+            # D9: link the identity's numeric id to it when its own response shows both
+            learned = self.agent.identity_vault.learn_from_response(identity, resp.body)
         res = {"step": step, "status": resp.status, "headers": resp.headers[:3000],
                "body": resp.body[:BODY_LIMIT], "body_truncated": len(resp.body) > BODY_LIMIT,
                "requests_left": self.budget - self.requests_used()}
+        if learned:
+            res["learned_markers"] = learned
         self._log("http_request", args, {"step": step, "status": resp.status,
                                          "len": len(resp.body)})
         return res
@@ -336,8 +342,8 @@ def build_server(session: HuntSession) -> Any:
         return session.extract_links(step)
 
     @server.tool(description="Register/update a test identity (credentials are hidden from "
-                             "later output; markers = how it shows up in responses; owned = "
-                             "{object_type: [ids]} it owns).")
+                             "later output; markers = how it shows up in responses — include "
+                             "its email AND its user id; owned = {object_type: [ids]} it owns).")
     def register_identity(name: str, role: str = "user", bearer: str = "",
                           cookies: Optional[Dict[str, str]] = None,
                           markers: Optional[List[str]] = None,

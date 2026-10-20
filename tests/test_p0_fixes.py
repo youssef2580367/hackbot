@@ -216,3 +216,142 @@ def test_d6_rce_claim_needs_command_output(validator):
     assert validator.validate(f).verdict == Verdict.READY_FOR_VALIDATOR
     f["proof"]["verified_refs"][0]["excerpt"] = "export finished"
     assert validator.validate(f).verdict == Verdict.DOWNGRADE
+
+
+# D7 ─────────────────────────────────────────────────────────────────────────
+def _vertical(excerpt):
+    return {"raw_title": "Mass assignment of role at self-registration grants admin",
+            "vuln_class": "mass_assignment / privilege escalation", "severity": "Critical",
+            "verification": "confirmed", "privileges_required": "none",
+            "attacker_identity": "anonymous", "victim_identity": "",
+            "impact": "an anonymous visitor created an account whose stored role is admin",
+            "proof": {"checks": [{"name": "impact", "passed": True},
+                                 {"name": "impact_evidence", "passed": True}],
+                      "verified_refs": [{"excerpt": excerpt, "source": "observed",
+                                         "supports": "both", "step": 4, "command": ""}]}}
+
+
+def test_d7_vertical_escalation_needs_no_victim(validator):
+    res = validator.validate(_vertical('"email":"hunter2@lab.test","role":"admin"'))
+    q6 = next(q for q in res.questions if q.q == "Q6")
+    assert q6.status == "pass", q6
+
+
+def test_d7_vertical_escalation_needs_elevated_role_in_evidence(validator):
+    res = validator.validate(_vertical('"email":"hunter2@lab.test","role":"customer"'))
+    q6 = next(q for q in res.questions if q.q == "Q6")
+    assert q6.status == "fail" and "elevated" in q6.detail
+
+
+def test_d7_horizontal_still_needs_two_identities(agent):
+    agent._record_finding(_act(victim_identity="hunter1"))  # attacker == victim
+    q6 = next(q for q in agent.findings[0].validation["questions"] if q["q"] == "Q6")
+    assert q6["status"] == "fail"
+
+
+# D8 ─────────────────────────────────────────────────────────────────────────
+@pytest.fixture
+def logic_agent(agent):
+    from hackbot.modes.agent import AgentStep
+
+    agent.steps.clear()
+    runs = [
+        (1, "curl -s -X PUT http://127.0.0.1:3000/api/BasketItems/9", '"id":9,"quantity":-5'),
+        (2, "curl -s -X POST http://127.0.0.1:3000/rest/basket/6/checkout",
+         '{"orderConfirmation":"87b1-1a1c"}'),
+        (3, "curl -s -X GET http://127.0.0.1:3000/rest/order-history",
+         '{"orderId":"87b1-1a1c","totalPrice":-9.95,"paymentId":null}'),
+    ]
+    for n, cmd, out in runs:
+        res = ToolResult(tool="curl", command=cmd, stdout=out, stderr="", return_code=0,
+                         duration=0.1, success=True)
+        agent.steps.append(AgentStep(step_num=n, action="execute", description="",
+                                     tool_result=res))
+    return agent
+
+
+LOGIC_ACT = dict(title="Negative quantities give negative-total orders", severity="High",
+                 attacker_identity="hunter2", victim_identity="",
+                 asset="http://127.0.0.1:3000/rest/basket/6/checkout",
+                 behavior="a negative quantity was stored and checkout placed the order",
+                 boundary="order totals must be non-negative and paid",
+                 impact="an order with total -9.95 and no payment was persisted")
+
+
+@pytest.mark.parametrize("vclass", ["business logic / improper input validation",
+                                    "price_manipulation", "payment_bypass"])
+def test_d8_end_state_readback_confirms_regardless_of_wording(logic_agent, vclass):
+    logic_agent._record_finding(_act(**LOGIC_ACT, vuln_class=vclass, evidence_refs=[
+        {"step": 1, "excerpt": '"quantity":-5', "supports": "behavior"},
+        {"step": 3, "excerpt": '"totalPrice":-9.95', "supports": "impact"}]))
+    f = logic_agent.findings[0]
+    assert f.confirmed, f.proof
+    rec = next(c for c in f.proof["checks"] if c["name"] == "recorded_proof")
+    assert "read back by a separate GET (step 3)" in rec["detail"]
+
+
+def test_d8_without_a_later_read_it_stays_a_lead(logic_agent):
+    logic_agent._record_finding(_act(**LOGIC_ACT, vuln_class="business logic", evidence_refs=[
+        {"step": 1, "excerpt": '"quantity":-5', "supports": "behavior"},
+        {"step": 2, "excerpt": '"orderConfirmation":"87b1-1a1c"', "supports": "impact"}]))
+    assert not logic_agent.findings[0].confirmed
+
+
+def test_d8_xss_still_needs_a_recording(logic_agent):
+    logic_agent._record_finding(_act(**LOGIC_ACT, vuln_class="stored xss", evidence_refs=[
+        {"step": 1, "excerpt": '"quantity":-5'}, {"step": 3, "excerpt": '"totalPrice":-9.95'}]))
+    assert not logic_agent.findings[0].confirmed
+
+
+# D9 ─────────────────────────────────────────────────────────────────────────
+def test_d9_learn_user_id_from_own_response():
+    v = IdentityVault.from_dict({"identities": {"hunter2": {"markers": ["hunter2@lab.test"]}}})
+    learned = v.learn_from_response(
+        "hunter2", '{"user": {"id": 26, "email": "hunter2@lab.test", "role": "customer"}}')
+    assert '"UserId":26' in learned
+    assert '"id":26' not in v.get("hunter2").markers  # too generic, never learned
+    assert v.learn_from_response("hunter2", '{"user": {"id": 26}}') == []  # no email: no link
+    assert v.learn_from_response("hunter2", "not json") == []
+
+
+def test_d9_numeric_id_in_evidence_links_the_victim(agent):
+    agent.identity_vault.learn_from_response(
+        "hunter2", '{"user": {"id": 26, "email": "hunter2@lab.test"}}')
+    from hackbot.modes.agent import AgentStep
+
+    res = ToolResult(tool="curl", command="curl -s http://127.0.0.1:3000/rest/basket/6",
+                     stdout='{"data":{"id":6,"coupon":null,"UserId":26}}', stderr="",
+                     return_code=0, duration=0.1, success=True)
+    agent.steps.append(AgentStep(step_num=9, action="execute", description="", tool_result=res))
+    agent._record_finding(_act(title="Basket IDOR", victim_identifier="basket 6 (UserId 26)",
+                               asset="http://127.0.0.1:3000/rest/basket/6",
+                               evidence_refs=[{"step": 9,
+                                               "excerpt": '"id":6,"coupon":null,"UserId":26'}]))
+    q6 = next(q for q in agent.findings[0].validation["questions"] if q["q"] == "Q6")
+    assert q6["status"] == "pass", q6
+
+
+def test_d9_mcp_session_learns_markers(tmp_path, monkeypatch):
+    import json as _json
+
+    from hackbot.mcp_server import HuntSession
+
+    scope = tmp_path / "scope.yaml"
+    scope.write_text("in_scope: ['http://127.0.0.1:3000']\n")
+
+    class P:
+        returncode = 0
+        stdout = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def communicate(self, input=None, timeout=None):
+            return ("HTTP/1.1 200 OK\r\n\r\n" + _json.dumps(
+                {"user": {"id": 25, "email": "hunter1@lab.test"}}), "")
+
+    monkeypatch.setattr("hackbot.core.runner.subprocess.Popen", P)
+    s = HuntSession(str(scope), run_dir=str(tmp_path / "run"), lab_mode=True)
+    s.register_identity("hunter1", bearer="tok-" + "z" * 30, markers=["hunter1@lab.test"])
+    out = s.http_request("GET", "http://127.0.0.1:3000/rest/user/whoami", identity="hunter1")
+    assert '"UserId":25' in out["learned_markers"]

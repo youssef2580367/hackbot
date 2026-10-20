@@ -223,6 +223,52 @@ class IdentityVault:
                 return ident.name
         return None
 
+    def learn_user_id(self, name: str, user_id: Any) -> List[str]:
+        """Add foreign-key style markers for identity *name*'s numeric/uuid id.
+
+        Only the specific forms ("UserId":26 …) are added — a bare ``"id":26``
+        would also match unrelated objects that happen to share the number.
+        """
+        ident = self.get(name)
+        uid = str(user_id).strip()
+        if not uid or len(uid) > 64:
+            return []
+        quoted = uid if uid.isdigit() else f'"{uid}"'
+        forms = [f'"{k}":{quoted}' for k in ("UserId", "userId", "user_id", "owner_id",
+                                             "ownerId", "accountId", "account_id")]
+        added = [f for f in forms if f not in ident.markers]
+        ident.markers.extend(added)
+        return added
+
+    def learn_from_response(self, name: str, body: str) -> List[str]:
+        """If *name*'s own response shows its email next to an ``id``, learn that id."""
+        import json as _json
+
+        try:
+            data = _json.loads(body)
+        except (ValueError, TypeError):
+            return []
+        ident = self.get(name)
+        emails = {m for m in ident.markers if "@" in m}
+        if not emails:
+            return []
+        learned: List[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                values = {str(v) for v in node.values() if isinstance(v, (str, int))}
+                if emails & values and isinstance(node.get("id"), (int, str)) and \
+                        str(node["id"]) not in emails:
+                    learned.extend(self.learn_user_id(name, node["id"]))
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node[:50]:
+                    walk(v)
+
+        walk(data)
+        return learned
+
     # ── ownership ledger ─────────────────────────────────────────────────
     def owner_of(self, object_id: str, obj_type: str = "") -> Optional[str]:
         for ident in self.identities.values():

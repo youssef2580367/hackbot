@@ -52,6 +52,9 @@ SPECULATIVE_RE = re.compile(
     re.I,
 )
 
+# Classes whose end state can instead be proven by a later read-only request.
+END_STATE_CLASSES = ("business logic", "race condition")
+
 # Classes whose impact is not observable in captured tool output alone.
 REQUIRES_RECORDED_PROOF: Dict[str, str] = {
     "xss": "script execution must be shown in a browser (screenshot/HAR of the payload firing "
@@ -72,7 +75,10 @@ _CLASS_KEYWORDS = {
     "csrf": ("csrf", "cross-site request forgery", "xsrf"),
     "clickjacking": ("clickjacking", "ui redress"),
     "race condition": ("race condition", "toctou"),
-    "business logic": ("business logic",),
+    "business logic": ("business logic", "business_logic", "price manipulation",
+                       "price_manipulation", "payment bypass", "payment_bypass",
+                       "negative quantity", "negative total", "coupon", "discount abuse",
+                       "workflow bypass", "logic flaw"),
     "session management": ("session management", "session not invalidated",
                            "not invalidated after", "privileges not revoked"),
 }
@@ -122,6 +128,16 @@ class Observation:
     # scripts or -c snippets). Such output can be shaped by the agent, so it
     # never confirms a pillar on its own.
     agent_authored: bool = False
+
+    @property
+    def method(self) -> str:
+        """HTTP method of a curl-style command (GET unless -X / a body says otherwise)."""
+        m = re.search(r"(?:^|\s)(?:-X|--request)\s+'?([A-Za-z]+)", self.command)
+        if m:
+            return m.group(1).upper()
+        if re.search(r"(?:^|\s)(-d|--data[\w-]*|-F|--form|--json)\s", self.command):
+            return "POST"
+        return "GET"
 
     @classmethod
     def from_command(cls, step: int, command: str, output: str) -> Optional["Observation"]:
@@ -322,9 +338,13 @@ class ProofGate:
         cls = detect_class(title, vuln_class)
         if cls in REQUIRES_RECORDED_PROOF:
             intact = [r for r in recorded if r.still_intact()]
+            readback = (self._end_state_readback(verified, observations)
+                        if cls in END_STATE_CLASSES else "")
+            ok = bool(intact) or bool(readback)
             checks.append(ProofCheck(
-                "recorded_proof", bool(intact),
+                "recorded_proof", ok,
                 f"{len(intact)} attested recording(s) present" if intact
+                else readback if readback
                 else f"{cls}: {REQUIRES_RECORDED_PROOF[cls]}",
             ))
 
@@ -338,6 +358,22 @@ class ProofGate:
         status = (Verification.CONFIRMED if all(c.passed for c in checks)
                   else Verification.LEAD)
         return ProofResult(status, checks, verified)
+
+    @staticmethod
+    def _end_state_readback(verified: List[Dict[str, Any]],
+                            observations: List[Observation]) -> str:
+        """A verified excerpt from a read-only request issued AFTER a cited
+        state-changing request proves the persisted end state."""
+        by_step = {o.step: o for o in observations}
+        cited = [by_step[v["step"]] for v in verified
+                 if v.get("source") == "observed" and v.get("step") in by_step]
+        writes = [o.step for o in cited if o.method not in ("GET", "HEAD")]
+        reads = [o.step for o in cited if o.method in ("GET", "HEAD")]
+        if writes and any(r > min(writes) for r in reads):
+            r = min(x for x in reads if x > min(writes))
+            return (f"end state read back by a separate GET (step {r}) after the "
+                    f"state-changing request (step {min(writes)})")
+        return ""
 
     @staticmethod
     def _stated(name: str, value: str, hint: str) -> ProofCheck:
