@@ -67,6 +67,9 @@ telegram = [
 rag = [
     "chromadb>=0.5.0",
 ]
+mcp = [
+    "mcp>=2.0",
+]
 all = [
     "flask>=3.0",
     "pywebview>=5.0",
