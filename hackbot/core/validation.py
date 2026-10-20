@@ -123,9 +123,14 @@ _GOTCHAS_ALIASES = {
 
 _VERTICAL_WORDS = ("privilege escalation", "privesc", "mass assignment", "mass_assignment",
                    "bopla", "role", "vertical")
-_ELEVATED_RE = re.compile(r"\"(role|roles|isAdmin|is_admin|is_staff|admin|permissions?|scope|"
-                          r"groups?)\"\s*:\s*\"?(admin|administrator|root|superuser|staff|true|"
-                          r"owner|manager|write|\*)", re.I)
+# D10: match elevated values by meaning (tenant_admin, org-owner, super_user …), not
+# only exact words.
+_ELEVATED_RE = re.compile(
+    r"\"(role|roles|isAdmin|is_admin|is_staff|admin|permissions?|scope|groups?|level|tier)\""
+    r"\s*:\s*(true|\[?\s*\"?[\w\-:. ]*(admin|root|super|staff|owner|manager|write|elevated|"
+    r"privileged|\*))", re.I)
+_FUNCTION_LEVEL_WORDS = ("bfla", "function level", "function-level", "function_level")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 
 _SQL_ERROR_RE = re.compile(
     r"sql syntax|mysql_fetch|ora-\d{5}|pg::|sqlstate|sqlite3?\.|unclosed quotation|"
@@ -337,11 +342,35 @@ _OVERCLAIMS = [
 _RCE_CLASSES = ("rce", "command injection", "code injection", "deserialization", "ssti")
 
 
-def _impact_overclaim(impact: str, excerpts: str, text: str) -> str:
+# D11: hosts that are internal by construction — single-label service names and
+# internal-only domains in the URLs the cited requests asked the server to fetch.
+_INTERNAL_URL_RE = re.compile(
+    r"https?://(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+|\[?::1\]?|"
+    r"[a-z0-9-]+|[a-z0-9.-]+\.(svc|cluster\.local|internal|local|lan|corp|intra))"
+    r"(:\d+)?(?=[/\"'\\\s?#]|$)",
+    re.I)
+
+
+def _payload_urls(commands: str) -> str:
+    """URLs inside the cited requests other than each request's own target (its last
+    URL): those are what the server was asked to fetch."""
+    out = []
+    for cmd in re.split(r"(?=\bcurl\b)", commands):
+        urls = re.findall(r"https?://[^\s'\"\\<>]+", cmd)
+        out += urls[:-1]
+    return " ".join(out)
+
+
+def _impact_overclaim(impact: str, excerpts: str, text: str, commands: str = "") -> str:
     low = impact.lower()
     for claim, needs in _OVERCLAIMS:
         m = re.search(claim, low)
         if not m:
+            continue
+        if "internal" in claim and _INTERNAL_URL_RE.search(_payload_urls(commands)) and \
+                re.search(r"internal|private|localhost|loopback", low):
+            # reach to an internal-only host is shown by the request itself
             continue
         if "rce" in claim and any(c in text for c in _RCE_CLASSES) and needs and \
                 re.search(needs, excerpts, re.I):
@@ -483,8 +512,20 @@ class FindingValidator:
                     "distinct tenants in the identity vault")
         a = str(finding.get("attacker_identity", "")).strip()
         b = str(finding.get("victim_identity", "")).strip()
-        vertical = not b and any(w in low for w in _VERTICAL_WORDS)
-        if vertical:
+        function_level = not b and any(w in low for w in _FUNCTION_LEVEL_WORDS)
+        vertical = not b and not function_level and any(w in low for w in _VERTICAL_WORDS)
+        if function_level:
+            # D13: BFLA evidence = a lower role reached the function AND received data
+            # that is not its own (another user's identifier), no victim identity needed.
+            own = {m.lower() for m in (finding.get("attacker_markers") or [])}
+            foreign = [e.group(0) for e in _EMAIL_RE.finditer(excerpts)
+                       if e.group(0).lower() not in own]
+            if not foreign:
+                return QuestionResult(
+                    "Q6", "fail",
+                    "function-level authorization: evidence must show data the attacker's "
+                    "role must not receive (another user's identifier)")
+        elif vertical:
             # Escalating the attacker's OWN account (e.g. role set at sign-up): there is
             # no victim; the evidence must show the elevated privilege itself.
             if not _ELEVATED_RE.search(excerpts):
@@ -513,7 +554,9 @@ class FindingValidator:
         if "cors" in low and "access-control-allow-credentials: true" not in excerpts.lower():
             return QuestionResult("Q6", "fail",
                                   "CORS without Access-Control-Allow-Credentials: true in evidence")
-        overclaim = _impact_overclaim(str(finding.get("impact", "")), excerpts, low)
+        cited_commands = " ".join(r.get("command", "") for r in proof.get("verified_refs") or [])
+        overclaim = _impact_overclaim(str(finding.get("impact", "")), excerpts, low,
+                                      cited_commands)
         if overclaim:
             return QuestionResult(
                 "Q6", "partial",

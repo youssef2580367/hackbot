@@ -57,6 +57,7 @@ class Context:
     outputs: str         # full output of cited steps
     commands: List[str]
     finding: Dict[str, Any]
+    step_outputs: List[str] = field(default_factory=list)  # one entry per cited step
 
 
 _WAF_RE = re.compile(
@@ -103,7 +104,11 @@ def _soft_404(ctx: Context) -> Optional[FPSignal]:
     if not _has(ctx.text, ("disclosure", "exposed", "exposure", "backup", "traversal",
                            "lfi", "directory listing", "sensitive file")):
         return None
-    if re.search(r"http/[\d.]+ 200", ctx.outputs, re.I) and _SOFT_404_RE.search(ctx.outputs):
+    # D12: judge each cited step on its own — a control step's real 404 must not make
+    # the positive steps look like soft 404s.
+    ok_steps = [o for o in (ctx.step_outputs or [ctx.outputs])
+                if re.search(r"http/[\d.]+ 200", o, re.I)]
+    if ok_steps and all(_SOFT_404_RE.search(o) for o in ok_steps):
         return FPSignal("SOFT_404", "high",
                         "status 200 but the body is a 'not found' page — a soft 404, not "
                         "exposed content")
@@ -221,7 +226,8 @@ class FalsePositiveClassifier:
         text = " ".join(str(finding.get(k, "")) for k in (
             "raw_title", "title", "vuln_class", "description", "behavior", "impact")).lower()
         ctx = Context(str(finding.get("raw_title", "")), str(finding.get("vuln_class", "")),
-                      text, excerpts, outputs, commands, finding)
+                      text, excerpts, outputs, commands, finding,
+                      [cited_outputs[s]["output"] for s in sorted(steps) if s in cited_outputs])
 
         signals = [s for s in (rule(ctx) for rule in RULES) if s]
         if any(s.confidence == "high" for s in signals):

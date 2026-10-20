@@ -355,3 +355,104 @@ def test_d9_mcp_session_learns_markers(tmp_path, monkeypatch):
     s.register_identity("hunter1", bearer="tok-" + "z" * 30, markers=["hunter1@lab.test"])
     out = s.http_request("GET", "http://127.0.0.1:3000/rest/user/whoami", identity="hunter1")
     assert '"UserId":25' in out["learned_markers"]
+
+
+# D10–D14 (blind fixture 1) ──────────────────────────────────────────────────
+def _confirmed(title, vclass, excerpt, **over):
+    f = {"raw_title": title, "vuln_class": vclass, "severity": "High",
+         "verification": "confirmed", "privileges_required": "user",
+         "impact": "shown in the excerpt", "attacker_identity": "alice", "victim_identity": "",
+         "proof": {"checks": [{"name": "impact", "passed": True},
+                              {"name": "impact_evidence", "passed": True}],
+                   "verified_refs": [{"excerpt": excerpt, "source": "observed",
+                                      "supports": "both", "step": 1, "command": ""}]}}
+    f.update(over)
+    return f
+
+
+@pytest.mark.parametrize("excerpt,ok", [
+    ('"role":"tenant_admin","tenant":"acme"', True),
+    ('"role": "org-owner"', True),
+    ('"roles": ["super_user"]', True),
+    ('"isAdmin": true', True),
+    ('"role":"member","tenant":"acme"', False),
+])
+def test_d10_elevated_role_by_meaning(validator, excerpt, ok):
+    res = validator.validate(_confirmed("Mass assignment lets a member self-promote",
+                                        "mass assignment / privilege escalation", excerpt))
+    assert (next(q for q in res.questions if q.q == "Q6").status == "pass") is ok
+
+
+def test_d11_internal_hostname_reach_is_not_overclaim(validator):
+    f = _confirmed("SSRF in logo import", "ssrf", '"note": "INTERNAL-ONLY PW-INV-3f9a1c"',
+                   impact="the server fetched an internal-only service and returned its body")
+    f["proof"]["verified_refs"][0]["command"] = (
+        "curl -s -X POST --data-raw '{\"url\": \"http://inventory-svc:8080/health\"}' "
+        "http://127.0.0.1:4000/api/v1/branding/logo-import")
+    assert validator.validate(f).verdict == Verdict.READY_FOR_VALIDATOR
+
+
+def test_d11_public_host_does_not_count_as_internal(validator):
+    f = _confirmed("SSRF in logo import", "ssrf", '"ok": true',
+                   impact="the server reaches internal network services")
+    f["proof"]["verified_refs"][0]["command"] = (
+        "curl -s -X POST --data-raw '{\"url\": \"https://carrier.example/x\"}' "
+        "http://127.0.0.1:4000/api/v1/branding/logo-import")
+    assert validator.validate(f).verdict == Verdict.DOWNGRADE
+
+
+def test_d12_control_step_404_does_not_make_a_soft_404():
+    from hackbot.core.fp_filter import FalsePositiveClassifier
+
+    finding = {"raw_title": "Path traversal in document download", "vuln_class": "traversal",
+               "proof": {"verified_refs": [
+                   {"excerpt": "Welcome to Parcelwise, Globex team.", "step": 2},
+                   {"excerpt": '{"error":"not found"}', "step": 3}]}}
+    outs = {2: {"command": "curl -s -i x", "output":
+                "HTTP/1.1 200 OK\r\n\r\nWelcome to Parcelwise, Globex team."},
+            3: {"command": "curl -s -i y", "output":
+                'HTTP/1.1 404 NOT FOUND\r\n\r\n{"error":"not found"}'}}
+    r = FalsePositiveClassifier().classify(finding, outs)
+    assert "SOFT_404" not in [s["code"] for s in r["signals"]]
+    outs[2]["output"] = "HTTP/1.1 200 OK\r\n\r\n<h1>Page not found</h1>"
+    r = FalsePositiveClassifier().classify(finding, outs)
+    assert "SOFT_404" in [s["code"] for s in r["signals"]]
+
+
+@pytest.mark.parametrize("excerpt,ok", [
+    ('{"email":"owner@globex.parcel","role":"tenant_admin"}', True),
+    ('{"email":"hunter1@lab.test","role":"member"}', False),  # only the attacker's own data
+    ('{"exported": true}', False),
+])
+def test_d13_bfla_without_victim_identity(validator, excerpt, ok):
+    res = validator.validate(_confirmed(
+        "Admin-only member export accessible to ordinary members",
+        "broken function-level authorization (BFLA)", excerpt,
+        attacker_markers=["hunter1@lab.test"]))
+    assert (next(q for q in res.questions if q.q == "Q6").status == "pass") is ok
+
+
+@pytest.mark.parametrize("act,expected", [
+    ({"vuln_class": "SQL injection"}, "input_handling"),
+    ({"vuln_class": "OS command injection"}, "input_handling"),
+    ({"vuln_class": "Path traversal / arbitrary file read"}, "input_handling"),
+    ({"vuln_class": "Broken function-level authorization (BFLA)"}, "function_level"),
+    ({"vuln_class": "BOLA / IDOR", "victim_identity": "hunter2"}, "object_level"),
+    ({"vuln_class": "business logic", "title": "promo reuse"}, "business_logic"),
+    ({"vuln_class": "auth bypass", "attacker_identity": "anonymous"}, "authentication"),
+])
+def test_d14_boundary_type_inferred_for_manual_findings(act, expected):
+    from hackbot.core.boundaries import infer_boundary_type
+
+    assert infer_boundary_type(act, None) == expected
+
+
+def test_d14_cross_tenant_manual_finding_gets_tenants(agent):
+    agent.identity_vault = IdentityVault.from_dict({"identities": {
+        "hunter1": {"tenant": "acme", "markers": ["hunter1@lab.test"]},
+        "hunter2": {"tenant": "globex", "markers": ["hunter2@lab.test"]}}})
+    agent._record_finding(_act(title="Invoice IDOR"))
+    f = agent.findings[0]
+    assert f.boundary_type == "tenant_isolation"
+    assert (f.attacker_tenant, f.victim_tenant) == ("acme", "globex")
+    assert f.title == "Invoice IDOR"  # hunter's text untouched

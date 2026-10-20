@@ -32,7 +32,7 @@ from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.core.authz_diff import AuthzDiff
 from hackbot.core.bfla import BflaTester, render_matrix
 from hackbot.core.bola import BolaTester
-from hackbot.core.boundaries import annotate_boundary
+from hackbot.core.boundaries import annotate_boundary, infer_boundary_type
 from hackbot.core.session_lifecycle import SessionLifecycle
 from hackbot.core.tenancy import TenantScanner
 from hackbot.core.corpus import Corpus
@@ -1801,6 +1801,9 @@ Explain your reasoning at each step."""
             if vault is not None and finding.victim_identity in vault.identities:
                 data["victim_markers"] = [m for m in vault.get(finding.victim_identity).markers
                                           if m]
+            if vault is not None and finding.attacker_identity in vault.identities:
+                data["attacker_markers"] = [m for m in
+                                            vault.get(finding.attacker_identity).markers if m]
             result = self.validator.validate(
                 data,
                 scope_policy=self.scope_policy,
@@ -1877,6 +1880,16 @@ Explain your reasoning at each step."""
         severity = parse_severity(action.get("severity", "Info"))
         if action.get("asset"):
             action = dict(action, asset=normalize_asset(str(action["asset"])))
+        if not action.get("boundary_type"):
+            # D14: manual findings get a boundary type too (engine findings already do)
+            inferred = infer_boundary_type(action, self.identity_vault)
+            if inferred:
+                action = dict(action, boundary_type=inferred)
+            vault = self.identity_vault
+            if inferred == "tenant_isolation" and vault is not None:
+                action = dict(action,
+                              attacker_tenant=vault.get(action["attacker_identity"]).tenant,
+                              victim_tenant=vault.get(action["victim_identity"]).tenant)
 
         title = action.get("title", "Untitled Finding")
         refs = action.get("evidence_refs") or []

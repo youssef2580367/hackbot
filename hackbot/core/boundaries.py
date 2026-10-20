@@ -25,6 +25,42 @@ class BoundaryType(str, Enum):
     FUNCTION_LEVEL = "function_level"
     OBJECT_LEVEL = "object_level"
     SESSION_LIFECYCLE = "session_lifecycle"
+    INPUT_HANDLING = "input_handling"
+    BUSINESS_LOGIC = "business_logic"
+
+
+_AUTHZ_WORDS = ("idor", "bola", "bfla", "authorization", "access control", "privilege",
+                "mass assignment", "mass_assignment", "bopla", "tenant", "auth bypass",
+                "authentication bypass", "account takeover")
+_INPUT_WORDS = ("injection", "sqli", "nosql", "xss", "ssrf", "traversal", "lfi", "xxe",
+                "deserializ", "ssti", "template", "upload", "command", "rce")
+_LOGIC_WORDS = ("business logic", "business_logic", "price", "payment", "coupon", "promo",
+                "negative", "race", "workflow", "logic")
+
+
+def infer_boundary_type(action: Dict[str, Any], vault: Optional[IdentityVault]) -> str:
+    """Boundary type for a manually recorded finding (D14). Never rewrites its text."""
+    text = " ".join(str(action.get(k, "")) for k in ("vuln_class", "title", "boundary")).lower()
+    attacker = str(action.get("attacker_identity", ""))
+    victim = str(action.get("victim_identity", ""))
+    a_t, v_t = _tenant(vault, attacker), _tenant(vault, victim)
+    if a_t and v_t and a_t != v_t and victim:
+        return BoundaryType.TENANT_ISOLATION.value
+    if "session" in text and ("invalidat" in text or "revok" in text):
+        return BoundaryType.SESSION_LIFECYCLE.value
+    if attacker == ANONYMOUS and any(w in text for w in ("auth", "token", "login", "jwt")):
+        return BoundaryType.AUTHENTICATION.value
+    if any(w in text for w in _INPUT_WORDS):
+        return BoundaryType.INPUT_HANDLING.value
+    if any(w in text for w in ("bfla", "function level", "function-level")):
+        return BoundaryType.FUNCTION_LEVEL.value
+    if any(w in text for w in _AUTHZ_WORDS):
+        return BoundaryType.OBJECT_LEVEL.value if victim else BoundaryType.FUNCTION_LEVEL.value
+    if any(w in text for w in _LOGIC_WORDS):
+        return BoundaryType.BUSINESS_LOGIC.value
+    if any(w in text for w in ("authentication", "jwt", "token", "login", "password")):
+        return BoundaryType.AUTHENTICATION.value
+    return ""
 
 
 def _tenant(vault: Optional[IdentityVault], name: str) -> str:
