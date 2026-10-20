@@ -243,7 +243,7 @@ class HuntSession:
 
     def record_finding(self, **fields: Any) -> Dict[str, Any]:
         msg = self.agent._record_finding({"action": "finding", **fields})
-        f = self.agent._find_existing(fields.get("title", "")) or self.agent.findings[-1]
+        f = getattr(self.agent, "last_finding", None) or self.agent.findings[-1]
         res = {"message": msg, "index": self.agent.findings.index(f),
                "status": "CONFIRMED" if f.confirmed else "UNVERIFIED LEAD",
                "missing": f.proof.get("missing", []),

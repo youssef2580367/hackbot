@@ -67,6 +67,31 @@ class Severity(str, Enum):
     INFO = "Info"
 
 
+_SEVERITY_ALIASES = {
+    "critical": Severity.CRITICAL, "crit": Severity.CRITICAL, "p1": Severity.CRITICAL,
+    "high": Severity.HIGH, "p2": Severity.HIGH,
+    "medium": Severity.MEDIUM, "moderate": Severity.MEDIUM, "med": Severity.MEDIUM,
+    "p3": Severity.MEDIUM,
+    "low": Severity.LOW, "p4": Severity.LOW,
+    "info": Severity.INFO, "informational": Severity.INFO, "none": Severity.INFO,
+    "p5": Severity.INFO,
+}
+
+
+def parse_severity(value: Any) -> Severity:
+    """Case-insensitive severity parsing ('critical', 'High', 'P2' …); unknown → Info."""
+    return _SEVERITY_ALIASES.get(str(value or "").strip().lower(), Severity.INFO)
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>]+", re.I)
+
+
+def normalize_asset(asset: str) -> str:
+    """The URL inside an asset string ('GET http://h/p?q=' → 'http://h/p?q=')."""
+    m = _URL_IN_TEXT.search(asset or "")
+    return m.group(0).rstrip(".,;)") if m else (asset or "").strip()
+
+
 @dataclass
 class Finding:
     """A security finding discovered during assessment."""
@@ -1660,6 +1685,30 @@ Explain your reasoning at each step."""
                 return f
         return None
 
+    def _find_same_evidence(self, refs: List[Any]) -> Optional[Finding]:
+        """A finding citing (mostly) the same captured steps describes the same bug."""
+        def steps(rs: List[Any]) -> set:
+            out = set()
+            for r in rs:
+                if isinstance(r, dict) and r.get("step") is not None:
+                    try:
+                        out.add(int(r["step"]))
+                    except (TypeError, ValueError):
+                        pass
+            return out
+
+        new = steps(refs)
+        if len(new) < 2:
+            return None
+        for f in self.findings:
+            old = steps(f.evidence_refs)
+            if len(old) < 2:
+                continue
+            shared = new & old
+            if len(shared) >= 2 and len(shared) >= 0.67 * min(len(new), len(old)):
+                return f
+        return None
+
     def _find_existing(self, title: str) -> Optional[Finding]:
         key = title.strip().lower()
         for f in self.findings:
@@ -1747,8 +1796,13 @@ Explain your reasoning at each step."""
     def prevalidate(self, finding: Finding) -> Dict[str, Any]:
         """Run the offline 7-Question Gate checks and store the result."""
         try:
+            data = finding.to_dict()
+            vault = self.identity_vault
+            if vault is not None and finding.victim_identity in vault.identities:
+                data["victim_markers"] = [m for m in vault.get(finding.victim_identity).markers
+                                          if m]
             result = self.validator.validate(
-                finding.to_dict(),
+                data,
                 scope_policy=self.scope_policy,
                 program=self.program_rules,
                 confirmed_titles=[f.title for f in self.findings if f.confirmed],
@@ -1820,10 +1874,9 @@ Explain your reasoning at each step."""
 
     def _record_finding(self, action: Dict[str, Any], ai_analysis: str = "") -> str:
         """Record a finding; the proof gate decides CONFIRMED vs LEAD."""
-        try:
-            severity = Severity(action.get("severity", "Info"))
-        except ValueError:
-            severity = Severity.INFO
+        severity = parse_severity(action.get("severity", "Info"))
+        if action.get("asset"):
+            action = dict(action, asset=normalize_asset(str(action["asset"])))
 
         title = action.get("title", "Untitled Finding")
         refs = action.get("evidence_refs") or []
@@ -1831,6 +1884,14 @@ Explain your reasoning at each step."""
             refs = [refs]
         existing = self._find_existing(title)
         same_bug = None if existing is not None else self._find_same_bug(action)
+        same_evidence = None if (existing is not None or same_bug is not None) \
+            else self._find_same_evidence(refs)
+        if same_evidence is not None and not same_evidence.confirmed:
+            # The same bug re-filed under a new title (e.g. after a mis-quoted
+            # excerpt): upgrade the earlier lead in place instead of duplicating it.
+            existing = same_evidence
+        elif same_evidence is not None:
+            same_bug = same_evidence
         if same_bug is not None:
             # Another demonstration of an already-recorded bug (other direction or
             # other engine): keep the finding as written, add the new evidence.
@@ -1881,6 +1942,7 @@ Explain your reasoning at each step."""
 
         self.evaluate_finding(finding)
         self._persist_finding(finding)
+        self.last_finding = finding
 
         label = "CONFIRMED" if finding.confirmed else "LEAD"
         step = AgentStep(

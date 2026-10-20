@@ -80,7 +80,11 @@ _NEVER_SUBMIT_MATCHERS: List[Tuple[str, str, str]] = [
     ("open redirect", r"open redirect",
      r"\b(oauth|token|code=|redirect_uri)\b.*\b(stolen|leak|captured)"),
     ("client_secret", r"client[_ ]secret", ""),
-    ("ssrf dns", r"ssrf", r"http/1\.[01] \d{3}|\binstance-id\b|\bami-id\b|<html|\{\s*\""),
+    # Only SSRF claims resting on DNS / out-of-band callbacks; a full HTTP read is a
+    # different (reportable) finding, judged by Q6.
+    ("ssrf dns", r"ssrf\b.*\b(dns|callback|interaction|pingback|out-of-band|oob)\b|"
+                 r"\b(dns|oob)\b.*\bssrf",
+     r"http/1\.[01] \d{3}|\binstance-id\b|\bami-id\b|<html|\{\s*\""),
     ("host header", r"host header injection", r"password reset|poison(ed|ing)"),
     ("rate limit", r"\brate[- ]limit",
      r"\b(otp|2fa|mfa|password reset|coupon|gift|voucher|redeem|transfer)\b"),
@@ -310,6 +314,38 @@ def _lower_severity(sev: str) -> str:
     return SEVERITY_ORDER[max(0, i - 1)]
 
 
+# Impact claims that need their own evidence (claim regex, evidence regex | None).
+# None = never provable inside a lab run, so the claim must not be made.
+_OVERCLAIMS = [
+    (r"cloud metadata|metadata service|instance metadata|iam credentials?",
+     r"169\.254\.169\.254|meta-?data|instance-id|security-credentials"),
+    (r"internal (network|services?|hosts?|systems?)|\bpivot",
+     r"\b10\.\d+\.\d+\.\d+|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\.internal\b|"
+     r"\.local\b|localhost|127\.0\.0\.1"),
+    (r"credential[- ]stuffing|on other (services|sites)", None),
+    (r"full (data(base)? )?compromise|complete compromise|entire database|full database|"
+     r"all (user )?data\b|full server compromise", None),
+    (r"remote code execution|\brce\b|arbitrary code execution",
+     r"uid=\d+|gid=\d+|root:x:0|nt authority"),
+]
+_RCE_CLASSES = ("rce", "command injection", "code injection", "deserialization", "ssti")
+
+
+def _impact_overclaim(impact: str, excerpts: str, text: str) -> str:
+    low = impact.lower()
+    for claim, needs in _OVERCLAIMS:
+        m = re.search(claim, low)
+        if not m:
+            continue
+        if "rce" in claim and any(c in text for c in _RCE_CLASSES) and needs and \
+                re.search(needs, excerpts, re.I):
+            continue
+        if needs and re.search(needs, excerpts, re.I):
+            continue
+        return m.group(0)
+    return ""
+
+
 class FindingValidator:
     def __init__(self, rules: Optional[RuleSet] = None):
         self.rules = rules or RuleSet.load()
@@ -355,6 +391,9 @@ class FindingValidator:
 
         # Q3 — asset in scope (the declared asset and every evidence command)
         asset = str(finding.get("asset", "")).strip()
+        url_in_asset = re.search(r"https?://[^\s'\"<>]+", asset)
+        if url_in_asset:
+            asset = url_in_asset.group(0).rstrip(".,;)")
         commands = [r["command"] for r in refs if r.get("command")]
         if scope_policy is None:
             q.append(QuestionResult("Q3", "human", "no enforced scope policy"))
@@ -444,7 +483,9 @@ class FindingValidator:
                 return QuestionResult(
                     "Q6", "fail", "auth-class finding needs two distinct identities (A reads B)",
                 )
-            if not vid or vid not in excerpts:
+            markers = [m for m in (finding.get("victim_markers") or []) if m]
+            candidates = [c for c in [vid] + markers if c]
+            if not any(c in excerpts for c in candidates):
                 return QuestionResult("Q6", "fail",
                                       "victim B's identifier must appear in verified evidence")
         if ("sqli" in low or "sql injection" in low) and excerpts and \
@@ -457,6 +498,12 @@ class FindingValidator:
         if "cors" in low and "access-control-allow-credentials: true" not in excerpts.lower():
             return QuestionResult("Q6", "fail",
                                   "CORS without Access-Control-Allow-Credentials: true in evidence")
+        overclaim = _impact_overclaim(str(finding.get("impact", "")), excerpts, low)
+        if overclaim:
+            return QuestionResult(
+                "Q6", "partial",
+                f"impact claims {overclaim!r}, which the verified evidence does not show — "
+                "state only what the excerpts prove")
         return QuestionResult("Q6", "pass", "impact backed by verified evidence")
 
     def _q7(self, finding, text, qualifier, confirmed) -> QuestionResult:
