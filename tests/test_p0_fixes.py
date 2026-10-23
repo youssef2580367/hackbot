@@ -535,3 +535,79 @@ def test_d16_flag_blocks_ready_verdict_until_reviewed(agent):
     f = agent.findings[0]
     assert f.confirmed  # the observation itself is real
     assert f.validation["verdict"] == "review_required"
+
+
+# D17–D20 (WebGoat baseline) ─────────────────────────────────────────────────
+def _q6(res):
+    return next(q for q in res.questions if q.q == "Q6")
+
+
+@pytest.mark.parametrize("excerpt,attacker,markers,ok", [
+    # a username, not an email, identifies another user
+    ('[{"username":"carol","admin":false}]', "alice", [], True),
+    ('[{"username":"alice-lab"},{"username":"carol"}]', "alice", ["alice-lab"], True),
+    # only the attacker's own login (known marker, or overlapping its identity name)
+    ('[{"username":"alice-lab","admin":false}]', "alice", ["alice-lab"], False),
+    ('[{"username":"alice-lab","admin":false}]', "alice", [], False),
+    # nothing known about the attacker: one value could be its own
+    ('[{"username":"carol","admin":false}]', "", [], False),
+    ('[{"username":"carol"},{"username":"dave"}]', "", [], True),
+    ('{"userHash":"abc123"}', "alice", [], False),
+])
+def test_d17_bfla_foreign_usernames(validator, excerpt, attacker, markers, ok):
+    res = validator.validate(_confirmed(
+        "Admin user list reachable by an ordinary user", "bfla", excerpt,
+        attacker_identity=attacker, attacker_markers=markers))
+    assert (_q6(res).status == "pass") is ok, _q6(res).detail
+
+
+def test_d18_computed_marker_proves_execution(validator):
+    f = _confirmed("OS command injection in file search", "command injection",
+                   '"stdout" : "HUNTIX_CMDI_51 images/x.txt"',
+                   impact="remote code execution as the application user")
+    f["proof"]["verified_refs"][0]["command"] = (
+        "curl -s --data 'q=x%3B+echo+HUNTIX_CMDI_%24((50%2B1))' http://127.0.0.1:8081/s")
+    assert validator.validate(f).verdict == Verdict.READY_FOR_VALIDATOR
+    # the same marker sent literally is only an echo, not execution
+    f["proof"]["verified_refs"][0]["command"] = (
+        "curl -s --data 'q=x%3B+echo+HUNTIX_CMDI_51' http://127.0.0.1:8081/s")
+    assert validator.validate(f).verdict == Verdict.DOWNGRADE
+
+
+@pytest.mark.parametrize("text,auth", [
+    ("unauthenticated spring boot actuator exposes configuration", False),
+    ("account takeover via reset token (ato)", True),
+    ("mass_assignment / privilege_escalation", False),  # unchanged: underscores
+])
+def test_d19_auth_class_matches_whole_words(text, auth):
+    from hackbot.core.validation import _is_auth_class
+
+    assert _is_auth_class(text) is auth
+
+
+def test_d19_config_exposure_not_judged_as_cross_user(validator):
+    res = validator.validate(_confirmed(
+        "Unauthenticated actuator endpoint exposes configuration",
+        "security_misconfiguration", '"activeProfiles":["lab"]',
+        attacker_identity="anonymous", privileges_required="none"))
+    assert _q6(res).status == "pass", _q6(res).detail
+
+
+@pytest.mark.parametrize("title,vclass", [
+    ("Authentication bypass in account verification", "broken_authentication"),
+    ("2FA security question bypass in account verification", "broken_authentication"),
+])
+def test_d20_same_bug_same_label_regardless_of_wording(validator, title, vclass):
+    res = validator.validate(_confirmed(title, vclass, '"lessonCompleted":true',
+                                        attacker_identity="hunter1",
+                                        victim_identifier="userId 12309746"))
+    assert _q6(res).status == "fail"
+    assert "not a registered test identity" in _q6(res).detail
+    # shown on the attacker's own account, the same bypass needs no victim
+    res = validator.validate(_confirmed(title, vclass, '"lessonCompleted":true',
+                                        attacker_identity="hunter1"))
+    assert _q6(res).status == "pass", _q6(res).detail
+    res = validator.validate(_confirmed(title, vclass, '"lessonCompleted":true',
+                                        attacker_identity="hunter1",
+                                        victim_identifier="hunter1"))
+    assert _q6(res).status == "pass", _q6(res).detail

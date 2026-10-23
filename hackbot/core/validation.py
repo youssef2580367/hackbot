@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import glob
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -109,6 +110,19 @@ _BUILTIN_NEVER_SUBMIT = [
 AUTH_CLASSES = ("idor", "bola", "auth bypass", "authentication bypass", "authorization",
                 "account takeover", "ato", "privilege escalation", "privesc", "bfla")
 
+
+def _is_auth_class(text: str) -> bool:
+    """D19: whole-word class match ("ato" must not match "actuator")."""
+    low = text.lower()
+    return any(re.search(rf"\b{re.escape(c)}\b", low) for c in AUTH_CLASSES)
+
+
+# D20: bypass of an authentication control (verification step, factor, token or cookie
+# check), judged the same way whatever the wording.
+_AUTHN_BYPASS_RE = re.compile(
+    r"auth(entication)?[ _-]bypass|broken[ _-]authentication|\b(2fa|mfa|otp)\b|"
+    r"security[ _-]questions?", re.I)
+
 # finding class → gotchas section title (lowercase)
 _GOTCHAS_ALIASES = {
     "xss": "xss", "sqli": "sqli", "sql injection": "sqli", "ssrf": "ssrf",
@@ -131,6 +145,9 @@ _ELEVATED_RE = re.compile(
     r"privileged|\*))", re.I)
 _FUNCTION_LEVEL_WORDS = ("bfla", "function level", "function-level", "function_level")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+# D17: user identifiers other than emails (usernames, logins, user ids) in JSON evidence.
+_USER_FIELD_RE = re.compile(
+    r"\"(username|user_?name|login|user_?id|owner|account_?id)\"\s*:\s*\"?([^\",}\]\s]+)", re.I)
 
 _SQL_ERROR_RE = re.compile(
     r"sql syntax|mysql_fetch|ora-\d{5}|pg::|sqlstate|sqlite3?\.|unclosed quotation|"
@@ -362,6 +379,18 @@ def _payload_urls(commands: str) -> str:
     return " ".join(out)
 
 
+_MARKER_RE = re.compile(r"\b([A-Z][A-Z0-9]*_(?:[A-Z0-9]+_)*)(\d+)\b")
+
+
+def _computed_marker(excerpts: str, commands: str) -> bool:
+    """D18: the output holds a marker whose prefix was sent but whose full value
+    never was (e.g. a number the server computed) — the input was evaluated,
+    not just echoed back."""
+    sent = urllib.parse.unquote(commands)
+    return any(m.group(1) in sent and m.group(0) not in sent
+               for m in _MARKER_RE.finditer(excerpts))
+
+
 def _impact_overclaim(impact: str, excerpts: str, text: str, commands: str = "") -> str:
     low = impact.lower()
     for claim, needs in _OVERCLAIMS:
@@ -373,12 +402,17 @@ def _impact_overclaim(impact: str, excerpts: str, text: str, commands: str = "")
             # reach to an internal-only host is shown by the request itself
             continue
         if "rce" in claim and any(c in text for c in _RCE_CLASSES) and needs and \
-                re.search(needs, excerpts, re.I):
+                (re.search(needs, excerpts, re.I) or _computed_marker(excerpts, commands)):
             continue
         if needs and re.search(needs, excerpts, re.I):
             continue
         return m.group(0)
     return ""
+
+
+def own_ids(finding: Dict[str, Any], attacker: str) -> set:
+    return {m.lower() for m in (finding.get("attacker_markers") or []) if m} | \
+        ({attacker.lower()} if attacker else set())
 
 
 class FindingValidator:
@@ -521,10 +555,19 @@ class FindingValidator:
         if function_level:
             # D13: BFLA evidence = a lower role reached the function AND received data
             # that is not its own (another user's identifier), no victim identity needed.
-            own = {m.lower() for m in (finding.get("attacker_markers") or [])}
+            own = own_ids(finding, a)
             foreign = [e.group(0) for e in _EMAIL_RE.finditer(excerpts)
                        if e.group(0).lower() not in own]
-            if not foreign:
+            # D17: usernames / user ids count too. A value overlapping the attacker's
+            # identity name may be its own login; with nothing known about the
+            # attacker, one value could be its own, so require two.
+            def _own_like(v: str) -> bool:
+                v = v.lower()
+                return v in own or bool(a) and (a.lower() in v or v in a.lower())
+            users = {m.group(2) for m in _USER_FIELD_RE.finditer(excerpts)
+                     if not _own_like(m.group(2))}
+            known = bool(finding.get("attacker_markers")) or bool(a)
+            if not foreign and len(users) < (1 if known else 2):
                 return QuestionResult(
                     "Q6", "fail",
                     "function-level authorization: evidence must show data the attacker's "
@@ -537,7 +580,17 @@ class FindingValidator:
                     "Q6", "fail",
                     "vertical privilege escalation: evidence must show the elevated "
                     "role/permission")
-        elif any(c in low for c in AUTH_CLASSES):
+        elif not b and _AUTHN_BYPASS_RE.search(low):
+            # D20: an authentication-control bypass shown on the attacker's own account
+            # needs no victim; shown on someone else's account, that account must be
+            # one of the hunter's registered test identities.
+            vid = str(finding.get("victim_identifier", "")).strip()
+            if vid and vid.lower() not in own_ids(finding, a):
+                return QuestionResult(
+                    "Q6", "fail",
+                    f"authentication bypass acted on {vid!r}, which is not a registered "
+                    "test identity — repeat it against your own second account")
+        elif _is_auth_class(low):
             vid = str(finding.get("victim_identifier", "")).strip()
             if not a or not b or a == b:
                 return QuestionResult(
